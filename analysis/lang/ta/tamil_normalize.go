@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hi
+package ta
 
 import (
 	"bytes"
@@ -21,16 +21,16 @@ import (
 	"github.com/blevesearch/bleve/registry"
 )
 
-const NormalizeName = "normalize_hi"
+const NormalizeName = "normalize_ta"
 
-type HindiNormalizeFilter struct {
+type TamilNormalizeFilter struct {
 }
 
-func NewHindiNormalizeFilter() *HindiNormalizeFilter {
-	return &HindiNormalizeFilter{}
+func NewTamilNormalizeFilter() *TamilNormalizeFilter {
+	return &TamilNormalizeFilter{}
 }
 
-func (s *HindiNormalizeFilter) Filter(input analysis.TokenStream) analysis.TokenStream {
+func (s *TamilNormalizeFilter) Filter(input analysis.TokenStream) analysis.TokenStream {
 	for _, token := range input {
 		term := normalize(token.Term)
 		token.Term = term
@@ -130,7 +130,7 @@ func normalize(input []byte) []byte {
 }
 
 func NormalizerFilterConstructor(config map[string]interface{}, cache *registry.Cache) (analysis.TokenFilter, error) {
-	return NewHindiNormalizeFilter(), nil
+	return NewTamilNormalizeFilter(), nil
 }
 
 func init() {

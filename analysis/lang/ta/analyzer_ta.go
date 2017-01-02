@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hi
+package ta
 
 import (
 	"github.com/blevesearch/bleve/analysis"
@@ -23,7 +23,7 @@ import (
 	"github.com/blevesearch/bleve/analysis/tokenizer/unicode"
 )
 
-const AnalyzerName = "hi"
+const AnalyzerName = "ta"
 
 func AnalyzerConstructor(config map[string]interface{}, cache *registry.Cache) (*analysis.Analyzer, error) {
 	tokenizer, err := cache.TokenizerNamed(unicode.Name)
@@ -38,15 +38,15 @@ func AnalyzerConstructor(config map[string]interface{}, cache *registry.Cache) (
 	if err != nil {
 		return nil, err
 	}
-	hindiNormalizeFilter, err := cache.TokenFilterNamed(NormalizeName)
+	tamilNormalizeFilter, err := cache.TokenFilterNamed(NormalizeName)
 	if err != nil {
 		return nil, err
 	}
-	stopHiFilter, err := cache.TokenFilterNamed(StopName)
+	stopTaFilter, err := cache.TokenFilterNamed(StopName)
 	if err != nil {
 		return nil, err
 	}
-	stemmerHiFilter, err := cache.TokenFilterNamed(StemmerName)
+	stemmerTaFilter, err := cache.TokenFilterNamed(StemmerName)
 	if err != nil {
 		return nil, err
 	}
@@ -55,9 +55,9 @@ func AnalyzerConstructor(config map[string]interface{}, cache *registry.Cache) (
 		TokenFilters: []analysis.TokenFilter{
 			toLowerFilter,
 			indicNormalizeFilter,
-			hindiNormalizeFilter,
-			stopHiFilter,
-			stemmerHiFilter,
+			tamilNormalizeFilter,
+			stopTaFilter,
+			stemmerTaFilter,
 		},
 	}
 	return &rv, nil

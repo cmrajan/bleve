@@ -12,26 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hi
+package ta
 
 import (
 	"bytes"
 	"unicode/utf8"
-
+	
 	"github.com/blevesearch/bleve/analysis"
 	"github.com/blevesearch/bleve/registry"
 )
 
-const StemmerName = "stemmer_hi"
+const StemmerName = "stemmer_ta"
 
-type HindiStemmerFilter struct {
+type TamilStemmerFilter struct {
 }
 
-func NewHindiStemmerFilter() *HindiStemmerFilter {
-	return &HindiStemmerFilter{}
+func NewTamilStemmerFilter() *TamilStemmerFilter {
+	return &TamilStemmerFilter{}
 }
 
-func (s *HindiStemmerFilter) Filter(input analysis.TokenStream) analysis.TokenStream {
+func (s *TamilStemmerFilter) Filter(input analysis.TokenStream) analysis.TokenStream {
 	for _, token := range input {
 		// if not protected keyword, stem it
 		if !token.KeyWord {
@@ -141,7 +141,7 @@ func stem(input []byte) []byte {
 }
 
 func StemmerFilterConstructor(config map[string]interface{}, cache *registry.Cache) (analysis.TokenFilter, error) {
-	return NewHindiStemmerFilter(), nil
+	return NewTamilStemmerFilter(), nil
 }
 
 func init() {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hi
+package ta
 
 import (
 	"reflect"
@@ -297,9 +297,9 @@ func TestHindiStemmerFilter(t *testing.T) {
 		},
 	}
 
-	hindiStemmerFilter := NewHindiStemmerFilter()
+	tamilStemmerFilter := NewTamilStemmerFilter()
 	for _, test := range tests {
-		actual := hindiStemmerFilter.Filter(test.input)
+		actual := tamilStemmerFilter.Filter(test.input)
 		if !reflect.DeepEqual(actual, test.output) {
 			t.Errorf("expected %#v, got %#v", test.output, actual)
 			t.Errorf("expected % x, got % x", test.output[0].Term, actual[0].Term)

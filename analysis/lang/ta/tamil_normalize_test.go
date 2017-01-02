@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hi
+package ta
 
 import (
 	"reflect"
@@ -21,7 +21,7 @@ import (
 	"github.com/blevesearch/bleve/analysis"
 )
 
-func TestHindiNormalizeFilter(t *testing.T) {
+func TestTamilNormalizeFilter(t *testing.T) {
 	tests := []struct {
 		input  analysis.TokenStream
 		output analysis.TokenStream
@@ -240,9 +240,9 @@ func TestHindiNormalizeFilter(t *testing.T) {
 		},
 	}
 
-	hindiNormalizeFilter := NewHindiNormalizeFilter()
+	tamilNormalizeFilter := NewTamilNormalizeFilter()
 	for _, test := range tests {
-		actual := hindiNormalizeFilter.Filter(test.input)
+		actual := tamilNormalizeFilter.Filter(test.input)
 		if !reflect.DeepEqual(actual, test.output) {
 			t.Errorf("expected %#v, got %#v", test.output, actual)
 			t.Errorf("expected % x, got % x", test.output[0].Term, actual[0].Term)
