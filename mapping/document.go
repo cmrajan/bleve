@@ -40,17 +40,19 @@ import (
 // are used.  To disable this automatic handling, set
 // Dynamic to false.
 type DocumentMapping struct {
-	Enabled         bool                        `json:"enabled"`
-	Dynamic         bool                        `json:"dynamic"`
-	Properties      map[string]*DocumentMapping `json:"properties,omitempty"`
-	Fields          []*FieldMapping             `json:"fields,omitempty"`
-	DefaultAnalyzer string                      `json:"default_analyzer,omitempty"`
+	Enabled              bool                        `json:"enabled"`
+	Dynamic              bool                        `json:"dynamic"`
+	Properties           map[string]*DocumentMapping `json:"properties,omitempty"`
+	Fields               []*FieldMapping             `json:"fields,omitempty"`
+	DefaultAnalyzer      string                      `json:"default_analyzer,omitempty"`
+	DefaultSynonymSource string                      `json:"default_synonym_source,omitempty"`
 
 	// StructTagKey overrides "json" when looking for field names in struct tags
 	StructTagKey string `json:"struct_tag_key,omitempty"`
 }
 
-func (dm *DocumentMapping) Validate(cache *registry.Cache) error {
+func (dm *DocumentMapping) Validate(cache *registry.Cache,
+	parentName string, fieldAliasCtx map[string]*FieldMapping) error {
 	var err error
 	if dm.DefaultAnalyzer != "" {
 		_, err := cache.AnalyzerNamed(dm.DefaultAnalyzer)
@@ -58,8 +60,18 @@ func (dm *DocumentMapping) Validate(cache *registry.Cache) error {
 			return err
 		}
 	}
-	for _, property := range dm.Properties {
-		err = property.Validate(cache)
+	if dm.DefaultSynonymSource != "" {
+		_, err := cache.SynonymSourceNamed(dm.DefaultSynonymSource)
+		if err != nil {
+			return err
+		}
+	}
+	for propertyName, property := range dm.Properties {
+		newParent := propertyName
+		if parentName != "" {
+			newParent = fmt.Sprintf("%s.%s", parentName, propertyName)
+		}
+		err = property.Validate(cache, newParent, fieldAliasCtx)
 		if err != nil {
 			return err
 		}
@@ -77,20 +89,28 @@ func (dm *DocumentMapping) Validate(cache *registry.Cache) error {
 				return err
 			}
 		}
-
-		err := validateFieldType(field.Type)
-		if err != nil {
-			return err
-		}
-
-		if field.Type == "vector" {
-			err := validateVectorField(field)
+		if field.SynonymSource != "" {
+			_, err = cache.SynonymSourceNamed(field.SynonymSource)
 			if err != nil {
 				return err
 			}
 		}
+		err := validateFieldMapping(field, parentName, fieldAliasCtx)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func validateFieldType(field *FieldMapping) error {
+	switch field.Type {
+	case "text", "datetime", "number", "boolean", "geopoint", "geoshape", "IP":
+		return nil
+	default:
+		return fmt.Errorf("field: '%s', unknown field type: '%s'",
+			field.Name, field.Type)
+	}
 }
 
 // analyzerNameForPath attempts to first find the field
@@ -100,6 +120,17 @@ func (dm *DocumentMapping) analyzerNameForPath(path string) string {
 	field := dm.fieldDescribedByPath(path)
 	if field != nil {
 		return field.Analyzer
+	}
+	return ""
+}
+
+// synonymSourceForPath attempts to first find the field
+// described by this path, then returns the analyzer
+// configured for that field
+func (dm *DocumentMapping) synonymSourceForPath(path string) string {
+	field := dm.fieldDescribedByPath(path)
+	if field != nil {
+		return field.SynonymSource
 	}
 	return ""
 }
@@ -148,15 +179,20 @@ func (dm *DocumentMapping) fieldDescribedByPath(path string) *FieldMapping {
 	return nil
 }
 
-// documentMappingForPath returns the EXACT and closest matches for a sub
+// documentMappingForPathElements returns the EXACT and closest matches for a sub
 // document or for an explicitly mapped field; the closest most specific
 // document mapping could be one that matches part of the provided path.
-func (dm *DocumentMapping) documentMappingForPath(path string) (
+func (dm *DocumentMapping) documentMappingForPathElements(pathElements []string) (
 	*DocumentMapping, *DocumentMapping) {
-	pathElements := decodePath(path)
+	var pathElementsCopy []string
+	if len(pathElements) == 0 {
+		pathElementsCopy = []string{""}
+	} else {
+		pathElementsCopy = pathElements
+	}
 	current := dm
 OUTER:
-	for i, pathElement := range pathElements {
+	for i, pathElement := range pathElementsCopy {
 		if subDocMapping, exists := current.Properties[pathElement]; exists {
 			current = subDocMapping
 			continue OUTER
@@ -164,7 +200,7 @@ OUTER:
 
 		// no subDocMapping matches this pathElement
 		// only if this is the last element check for field name
-		if i == len(pathElements)-1 {
+		if i == len(pathElementsCopy)-1 {
 			for _, field := range current.Fields {
 				if field.Name == pathElement {
 					break
@@ -175,6 +211,15 @@ OUTER:
 		return nil, current
 	}
 	return current, current
+}
+
+// documentMappingForPath returns the EXACT and closest matches for a sub
+// document or for an explicitly mapped field; the closest most specific
+// document mapping could be one that matches part of the provided path.
+func (dm *DocumentMapping) documentMappingForPath(path string) (
+	*DocumentMapping, *DocumentMapping) {
+	pathElements := decodePath(path)
+	return dm.documentMappingForPathElements(pathElements)
 }
 
 // NewDocumentMapping returns a new document mapping
@@ -273,6 +318,11 @@ func (dm *DocumentMapping) UnmarshalJSON(data []byte) error {
 			if err != nil {
 				return err
 			}
+		case "default_synonym_source":
+			err := util.UnmarshalJSON(v, &dm.DefaultSynonymSource)
+			if err != nil {
+				return err
+			}
 		case "properties":
 			err := util.UnmarshalJSON(v, &dm.Properties)
 			if err != nil {
@@ -311,6 +361,22 @@ func (dm *DocumentMapping) defaultAnalyzerName(path []string) string {
 		}
 		if current.DefaultAnalyzer != "" {
 			rv = current.DefaultAnalyzer
+		}
+	}
+	return rv
+}
+
+func (dm *DocumentMapping) defaultSynonymSource(path []string) string {
+	current := dm
+	rv := current.DefaultSynonymSource
+	for _, pathElement := range path {
+		var ok bool
+		current, ok = current.Properties[pathElement]
+		if !ok {
+			break
+		}
+		if current.DefaultSynonymSource != "" {
+			rv = current.DefaultSynonymSource
 		}
 	}
 	return rv
@@ -395,9 +461,8 @@ func (dm *DocumentMapping) walkDocument(data interface{}, path []string, indexes
 }
 
 func (dm *DocumentMapping) processProperty(property interface{}, path []string, indexes []uint64, context *walkContext) {
-	pathString := encodePath(path)
 	// look to see if there is a mapping for this field
-	subDocMapping, closestDocMapping := dm.documentMappingForPath(pathString)
+	subDocMapping, closestDocMapping := dm.documentMappingForPathElements(path)
 
 	// check to see if we even need to do further processing
 	if subDocMapping != nil && !subDocMapping.Enabled {
@@ -409,6 +474,8 @@ func (dm *DocumentMapping) processProperty(property interface{}, path []string, 
 		// cannot do anything with the zero value
 		return
 	}
+
+	pathString := encodePath(path)
 	propertyType := propertyValue.Type()
 	switch propertyType.Kind() {
 	case reflect.String:
@@ -420,6 +487,8 @@ func (dm *DocumentMapping) processProperty(property interface{}, path []string, 
 					fieldMapping.processGeoShape(property, pathString, path, indexes, context)
 				} else if fieldMapping.Type == "geopoint" {
 					fieldMapping.processGeoPoint(property, pathString, path, indexes, context)
+				} else if fieldMapping.Type == "vector_base64" {
+					fieldMapping.processVectorBase64(property, pathString, path, indexes, context)
 				} else {
 					fieldMapping.processString(propertyValueString, pathString, path, indexes, context)
 				}
@@ -509,7 +578,8 @@ func (dm *DocumentMapping) processProperty(property interface{}, path []string, 
 			dm.walkDocument(property, path, indexes, context)
 		}
 	case reflect.Map, reflect.Slice:
-		if subDocMapping != nil {
+		walkDocument := false
+		if subDocMapping != nil && len(subDocMapping.Fields) != 0 {
 			for _, fieldMapping := range subDocMapping.Fields {
 				switch fieldMapping.Type {
 				case "vector":
@@ -517,17 +587,26 @@ func (dm *DocumentMapping) processProperty(property interface{}, path []string, 
 						indexes, context)
 				case "geopoint":
 					fieldMapping.processGeoPoint(property, pathString, path, indexes, context)
+					walkDocument = true
 				case "IP":
 					ip, ok := property.(net.IP)
 					if ok {
 						fieldMapping.processIP(ip, pathString, path, indexes, context)
 					}
+					walkDocument = true
 				case "geoshape":
 					fieldMapping.processGeoShape(property, pathString, path, indexes, context)
+					walkDocument = true
+				default:
+					walkDocument = true
 				}
 			}
+		} else {
+			walkDocument = true
 		}
-		dm.walkDocument(property, path, indexes, context)
+		if walkDocument {
+			dm.walkDocument(property, path, indexes, context)
+		}
 	case reflect.Ptr:
 		if !propertyValue.IsNil() {
 			switch property := property.(type) {

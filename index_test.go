@@ -304,7 +304,7 @@ func TestBytesWritten(t *testing.T) {
 	typeFieldMapping.DocValues = false
 	documentMapping.AddFieldMappingsAt("type", typeFieldMapping)
 
-	err = checkStatsOnIndexedBatch(tmpIndexPath, indexMapping, 37767)
+	err = checkStatsOnIndexedBatch(tmpIndexPath, indexMapping, 57273)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestBytesWritten(t *testing.T) {
 	contentFieldMapping.Store = true
 	tmpIndexPath1 := createTmpIndexPath(t)
 
-	err := checkStatsOnIndexedBatch(tmpIndexPath1, indexMapping, 56582)
+	err := checkStatsOnIndexedBatch(tmpIndexPath1, indexMapping, 76069)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func TestBytesWritten(t *testing.T) {
 	contentFieldMapping.IncludeInAll = true
 	tmpIndexPath2 := createTmpIndexPath(t)
 
-	err = checkStatsOnIndexedBatch(tmpIndexPath2, indexMapping, 44714)
+	err = checkStatsOnIndexedBatch(tmpIndexPath2, indexMapping, 68875)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +333,7 @@ func TestBytesWritten(t *testing.T) {
 	contentFieldMapping.IncludeTermVectors = true
 	tmpIndexPath3 := createTmpIndexPath(t)
 
-	err = checkStatsOnIndexedBatch(tmpIndexPath3, indexMapping, 59479)
+	err = checkStatsOnIndexedBatch(tmpIndexPath3, indexMapping, 78985)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,11 +343,221 @@ func TestBytesWritten(t *testing.T) {
 	contentFieldMapping.DocValues = true
 	tmpIndexPath4 := createTmpIndexPath(t)
 
-	err = checkStatsOnIndexedBatch(tmpIndexPath4, indexMapping, 44722)
+	err = checkStatsOnIndexedBatch(tmpIndexPath4, indexMapping, 64228)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cleanupTmpIndexPath(t, tmpIndexPath4)
+}
+
+func createIndexMappingOnSampleData() *mapping.IndexMappingImpl {
+	indexMapping := NewIndexMapping()
+	indexMapping.TypeField = "type"
+	indexMapping.DefaultAnalyzer = "en"
+	indexMapping.ScoringModel = index.DefaultScoringModel
+	documentMapping := NewDocumentMapping()
+	indexMapping.AddDocumentMapping("hotel", documentMapping)
+	indexMapping.StoreDynamic = false
+	indexMapping.DocValuesDynamic = false
+	contentFieldMapping := NewTextFieldMapping()
+	contentFieldMapping.Store = false
+
+	reviewsMapping := NewDocumentMapping()
+	reviewsMapping.AddFieldMappingsAt("content", contentFieldMapping)
+	documentMapping.AddSubDocumentMapping("reviews", reviewsMapping)
+
+	typeFieldMapping := NewTextFieldMapping()
+	typeFieldMapping.Store = false
+	documentMapping.AddFieldMappingsAt("type", typeFieldMapping)
+
+	return indexMapping
+}
+
+func TestBM25TFIDFScoring(t *testing.T) {
+	tmpIndexPath1 := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath1)
+	tmpIndexPath2 := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath2)
+
+	indexMapping := createIndexMappingOnSampleData()
+	indexMapping.ScoringModel = index.BM25Scoring
+	indexBM25, err := NewUsing(tmpIndexPath1, indexMapping, Config.DefaultIndexType, Config.DefaultMemKVStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	indexMapping1 := createIndexMappingOnSampleData()
+	indexTFIDF, err := NewUsing(tmpIndexPath2, indexMapping1, Config.DefaultIndexType, Config.DefaultMemKVStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err := indexBM25.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = indexTFIDF.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batch, err := getBatchFromData(indexBM25, "sample-data.json")
+	if err != nil {
+		t.Fatalf("failed to form a batch")
+	}
+	err = indexBM25.Batch(batch)
+	if err != nil {
+		t.Fatalf("failed to index batch %v\n", err)
+	}
+	query := NewMatchQuery("Hotel")
+	query.FieldVal = "name"
+	searchRequest := NewSearchRequestOptions(query, int(10), 0, true)
+
+	resBM25, err := indexBM25.Search(searchRequest)
+	if err != nil {
+		t.Error(err)
+	}
+
+	batch, err = getBatchFromData(indexTFIDF, "sample-data.json")
+	if err != nil {
+		t.Fatalf("failed to form a batch")
+	}
+	err = indexTFIDF.Batch(batch)
+	if err != nil {
+		t.Fatalf("failed to index batch %v\n", err)
+	}
+
+	resTFIDF, err := indexTFIDF.Search(searchRequest)
+	if err != nil {
+		t.Error(err)
+	}
+
+	for i, hit := range resTFIDF.Hits {
+		if hit.Score < resBM25.Hits[i].Score {
+			t.Fatalf("expected the score to be higher for BM25, got %v and %v",
+				resBM25.Hits[i].Score, hit.Score)
+		}
+	}
+}
+
+func TestBM25GlobalScoring(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	indexMapping := createIndexMappingOnSampleData()
+	indexMapping.ScoringModel = index.BM25Scoring
+	idxSinglePartition, err := NewUsing(tmpIndexPath, indexMapping, Config.DefaultIndexType, Config.DefaultMemKVStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err := idxSinglePartition.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batch, err := getBatchFromData(idxSinglePartition, "sample-data.json")
+	if err != nil {
+		t.Fatalf("failed to form a batch")
+	}
+	err = idxSinglePartition.Batch(batch)
+	if err != nil {
+		t.Fatalf("failed to index batch %v\n", err)
+	}
+	query := NewMatchQuery("Hotel")
+	query.FieldVal = "name"
+	searchRequest := NewSearchRequestOptions(query, int(10), 0, true)
+
+	res, err := idxSinglePartition.Search(searchRequest)
+	if err != nil {
+		t.Error(err)
+	}
+
+	singlePartHits := res.Hits
+
+	dataset, _ := readDataFromFile("sample-data.json")
+	tmpIndexPath1 := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath1)
+
+	idxPart1, err := NewUsing(tmpIndexPath1, indexMapping, Config.DefaultIndexType, Config.DefaultMemKVStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err := idxPart1.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batch1 := idxPart1.NewBatch()
+	for _, doc := range dataset[:len(dataset)/2] {
+		err = batch1.Index(fmt.Sprintf("%d", doc["id"]), doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = idxPart1.Batch(batch1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpIndexPath2 := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath2)
+
+	idxPart2, err := NewUsing(tmpIndexPath2, indexMapping, Config.DefaultIndexType, Config.DefaultMemKVStore, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err := idxPart2.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batch2 := idxPart2.NewBatch()
+	for _, doc := range dataset[len(dataset)/2:] {
+		err = batch2.Index(fmt.Sprintf("%d", doc["id"]), doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = idxPart2.Batch(batch2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	multiPartIndex := NewIndexAlias(idxPart1, idxPart2)
+	err = multiPartIndex.SetIndexMapping(indexMapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	// this key is set to ensure that we have a consistent scoring at the index alias
+	// level (it forces a pre search phase which can have a small overhead)
+	ctx = context.WithValue(ctx, search.SearchTypeKey, search.GlobalScoring)
+
+	res, err = multiPartIndex.SearchInContext(ctx, searchRequest)
+	if err != nil {
+		t.Error(err)
+	}
+
+	for i, hit := range res.Hits {
+		if hit.Score != singlePartHits[i].Score {
+			t.Fatalf("expected the scores to be the same, got %v and %v",
+				hit.Score, singlePartHits[i].Score)
+		}
+	}
+
 }
 
 func TestBytesRead(t *testing.T) {
@@ -401,9 +611,15 @@ func TestBytesRead(t *testing.T) {
 	}
 	stats, _ := idx.StatsMap()["index"].(map[string]interface{})
 	prevBytesRead, _ := stats["num_bytes_read_at_query_time"].(uint64)
-	if prevBytesRead != 36066 && res.Cost == prevBytesRead {
-		t.Fatalf("expected bytes read for query string 32349, got %v",
-			prevBytesRead)
+
+	expectedBytesRead := uint64(22049)
+	if supportForVectorSearch {
+		expectedBytesRead = 22459
+	}
+
+	if prevBytesRead != expectedBytesRead && res.Cost == prevBytesRead {
+		t.Fatalf("expected bytes read for query string %v, got %v",
+			expectedBytesRead, prevBytesRead)
 	}
 
 	// subsequent queries on the same field results in lesser amount
@@ -415,8 +631,8 @@ func TestBytesRead(t *testing.T) {
 	}
 	stats, _ = idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ := stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead-prevBytesRead != 23 && res.Cost == bytesRead-prevBytesRead {
-		t.Fatalf("expected bytes read for query string 23, got %v",
+	if bytesRead-prevBytesRead != 66 && res.Cost == bytesRead-prevBytesRead {
+		t.Fatalf("expected bytes read for query string 66, got %v",
 			bytesRead-prevBytesRead)
 	}
 	prevBytesRead = bytesRead
@@ -448,8 +664,8 @@ func TestBytesRead(t *testing.T) {
 
 	stats, _ = idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if !approxSame(bytesRead-prevBytesRead, 150) && res.Cost == bytesRead-prevBytesRead {
-		t.Fatalf("expected bytes read for faceted query is around 150, got %v",
+	if !approxSame(bytesRead-prevBytesRead, 196) && res.Cost == bytesRead-prevBytesRead {
+		t.Fatalf("expected bytes read for faceted query is around 196, got %v",
 			bytesRead-prevBytesRead)
 	}
 	prevBytesRead = bytesRead
@@ -481,8 +697,8 @@ func TestBytesRead(t *testing.T) {
 
 	stats, _ = idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead-prevBytesRead != 60 && res.Cost == bytesRead-prevBytesRead {
-		t.Fatalf("expected bytes read for query with highlighter is 60, got %v",
+	if bytesRead-prevBytesRead != 105 && res.Cost == bytesRead-prevBytesRead {
+		t.Fatalf("expected bytes read for query with highlighter is 105, got %v",
 			bytesRead-prevBytesRead)
 	}
 	prevBytesRead = bytesRead
@@ -498,37 +714,10 @@ func TestBytesRead(t *testing.T) {
 	// since it's created afresh and not reused
 	stats, _ = idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead-prevBytesRead != 83 && res.Cost == bytesRead-prevBytesRead {
-		t.Fatalf("expected bytes read for disjunction query is 83, got %v",
+	if bytesRead-prevBytesRead != 120 && res.Cost == bytesRead-prevBytesRead {
+		t.Fatalf("expected bytes read for disjunction query is 120, got %v",
 			bytesRead-prevBytesRead)
 	}
-}
-
-func getBatchFromData(idx Index, fileName string) (*Batch, error) {
-	pwd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-	path := filepath.Join(pwd, "data", "test", fileName)
-	batch := idx.NewBatch()
-	var dataset []map[string]interface{}
-	fileContent, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	err = json.Unmarshal(fileContent, &dataset)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, doc := range dataset {
-		err = batch.Index(fmt.Sprintf("%d", doc["id"]), doc)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return batch, err
 }
 
 func TestBytesReadStored(t *testing.T) {
@@ -580,8 +769,14 @@ func TestBytesReadStored(t *testing.T) {
 
 	stats, _ := idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ := stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead != 25928 && bytesRead == res.Cost {
-		t.Fatalf("expected the bytes read stat to be around 25928, got %v", bytesRead)
+
+	expectedBytesRead := uint64(11911)
+	if supportForVectorSearch {
+		expectedBytesRead = 12321
+	}
+
+	if bytesRead != expectedBytesRead && bytesRead == res.Cost {
+		t.Fatalf("expected the bytes read stat to be around %v, got %v", expectedBytesRead, bytesRead)
 	}
 	prevBytesRead := bytesRead
 
@@ -592,8 +787,8 @@ func TestBytesReadStored(t *testing.T) {
 	}
 	stats, _ = idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead-prevBytesRead != 15 && bytesRead-prevBytesRead == res.Cost {
-		t.Fatalf("expected the bytes read stat to be around 15, got %v", bytesRead-prevBytesRead)
+	if bytesRead-prevBytesRead != 48 && bytesRead-prevBytesRead == res.Cost {
+		t.Fatalf("expected the bytes read stat to be around 48, got %v", bytesRead-prevBytesRead)
 	}
 	prevBytesRead = bytesRead
 
@@ -607,8 +802,8 @@ func TestBytesReadStored(t *testing.T) {
 	stats, _ = idx.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
 
-	if bytesRead-prevBytesRead != 26478 && bytesRead-prevBytesRead == res.Cost {
-		t.Fatalf("expected the bytes read stat to be around 26478, got %v",
+	if bytesRead-prevBytesRead != 26511 && bytesRead-prevBytesRead == res.Cost {
+		t.Fatalf("expected the bytes read stat to be around 26511, got %v",
 			bytesRead-prevBytesRead)
 	}
 	idx.Close()
@@ -651,8 +846,14 @@ func TestBytesReadStored(t *testing.T) {
 
 	stats, _ = idx1.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead != 18114 && bytesRead == res.Cost {
-		t.Fatalf("expected the bytes read stat to be around 18114, got %v", bytesRead)
+
+	expectedBytesRead = uint64(4097)
+	if supportForVectorSearch {
+		expectedBytesRead = 4507
+	}
+
+	if bytesRead != expectedBytesRead && bytesRead == res.Cost {
+		t.Fatalf("expected the bytes read stat to be around %v, got %v", expectedBytesRead, bytesRead)
 	}
 	prevBytesRead = bytesRead
 
@@ -662,8 +863,8 @@ func TestBytesReadStored(t *testing.T) {
 	}
 	stats, _ = idx1.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead-prevBytesRead != 12 && bytesRead-prevBytesRead == res.Cost {
-		t.Fatalf("expected the bytes read stat to be around 12, got %v", bytesRead-prevBytesRead)
+	if bytesRead-prevBytesRead != 47 && bytesRead-prevBytesRead == res.Cost {
+		t.Fatalf("expected the bytes read stat to be around 47, got %v", bytesRead-prevBytesRead)
 	}
 	prevBytesRead = bytesRead
 
@@ -675,9 +876,43 @@ func TestBytesReadStored(t *testing.T) {
 
 	stats, _ = idx1.StatsMap()["index"].(map[string]interface{})
 	bytesRead, _ = stats["num_bytes_read_at_query_time"].(uint64)
-	if bytesRead-prevBytesRead != 42 && bytesRead-prevBytesRead == res.Cost {
-		t.Fatalf("expected the bytes read stat to be around 42, got %v", bytesRead-prevBytesRead)
+	if bytesRead-prevBytesRead != 77 && bytesRead-prevBytesRead == res.Cost {
+		t.Fatalf("expected the bytes read stat to be around 77, got %v", bytesRead-prevBytesRead)
 	}
+}
+
+func readDataFromFile(fileName string) ([]map[string]interface{}, error) {
+	pwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(pwd, "data", "test", fileName)
+
+	var dataset []map[string]interface{}
+	fileContent, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(fileContent, &dataset)
+	if err != nil {
+		return nil, err
+	}
+
+	return dataset, nil
+}
+
+func getBatchFromData(idx Index, fileName string) (*Batch, error) {
+	dataset, err := readDataFromFile(fileName)
+	batch := idx.NewBatch()
+	for _, doc := range dataset {
+		err = batch.Index(fmt.Sprintf("%d", doc["id"]), doc)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return batch, err
 }
 
 func TestIndexCreateNewOverExisting(t *testing.T) {
@@ -2933,5 +3168,64 @@ func TestCopyIndex(t *testing.T) {
 		if !efp {
 			t.Errorf("copy field %s is missing", ef)
 		}
+	}
+}
+
+func TestFuzzyScoring(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	mp := NewIndexMapping()
+	mp.DefaultAnalyzer = "simple"
+	idx, err := New(tmpIndexPath, mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	batch := idx.NewBatch()
+
+	docs := []map[string]interface{}{
+		{
+			"textField": "ab",
+		},
+		{
+			"textField": "abc",
+		},
+		{
+			"textField": "abcd",
+		},
+	}
+
+	for _, doc := range docs {
+		err := batch.Index(fmt.Sprintf("%v", doc["textField"]), doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = idx.Batch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	query := NewFuzzyQuery("ab")
+	query.Fuzziness = 2
+	searchRequest := NewSearchRequestOptions(query, 10, 0, true)
+	res, err := idx.Search(searchRequest)
+	if err != nil {
+		t.Error(err)
+	}
+
+	maxScore := res.Hits[0].Score
+
+	for i, hit := range res.Hits {
+		if maxScore/float64(i+1) != hit.Score {
+			t.Errorf("expected score - %f, got score - %f", maxScore/float64(i+1), hit.Score)
+		}
+	}
+
+	err = idx.Close()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

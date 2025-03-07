@@ -74,9 +74,14 @@ type FieldMapping struct {
 	Dims int `json:"dims,omitempty"`
 
 	// Similarity is the similarity algorithm used for scoring
-	// vector fields.
-	// See: util.DefaultSimilarityMetric & util.SupportedSimilarityMetrics
+	// field's content while performing search on it.
+	// See: index.SimilarityModels
 	Similarity string `json:"similarity,omitempty"`
+
+	// Applicable to vector fields only - optimization string
+	VectorIndexOptimizedFor string `json:"vector_index_optimized_for,omitempty"`
+
+	SynonymSource string `json:"synonym_source,omitempty"`
 }
 
 // NewTextFieldMapping returns a default field mapping for text
@@ -99,7 +104,7 @@ func newTextFieldMappingDynamic(im *IndexMappingImpl) *FieldMapping {
 	return rv
 }
 
-// NewKeyworFieldMapping returns a default field mapping for text with analyzer "keyword".
+// NewKeywordFieldMapping returns a default field mapping for text with analyzer "keyword".
 func NewKeywordFieldMapping() *FieldMapping {
 	return &FieldMapping{
 		Type:               "text",
@@ -457,12 +462,22 @@ func (fm *FieldMapping) UnmarshalJSON(data []byte) error {
 				return err
 			}
 		case "dims":
-			err := json.Unmarshal(v, &fm.Dims)
+			err := util.UnmarshalJSON(v, &fm.Dims)
 			if err != nil {
 				return err
 			}
 		case "similarity":
-			err := json.Unmarshal(v, &fm.Similarity)
+			err := util.UnmarshalJSON(v, &fm.Similarity)
+			if err != nil {
+				return err
+			}
+		case "vector_index_optimized_for":
+			err := util.UnmarshalJSON(v, &fm.VectorIndexOptimizedFor)
+			if err != nil {
+				return err
+			}
+		case "synonym_source":
+			err := util.UnmarshalJSON(v, &fm.SynonymSource)
 			if err != nil {
 				return err
 			}

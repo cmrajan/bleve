@@ -43,10 +43,15 @@ type BooleanField struct {
 }
 
 func (b *BooleanField) Size() int {
+	var freqSize int
+	if b.frequencies != nil {
+		freqSize = b.frequencies.Size()
+	}
 	return reflectStaticSizeBooleanField + size.SizeOfPtr +
 		len(b.name) +
 		len(b.arrayPositions)*size.SizeOfUint64 +
-		len(b.value)
+		len(b.value) +
+		freqSize
 }
 
 func (b *BooleanField) Name() string {
@@ -111,13 +116,13 @@ func NewBooleanFieldFromBytes(name string, arrayPositions []uint64, value []byte
 		name:              name,
 		arrayPositions:    arrayPositions,
 		value:             value,
-		options:           DefaultNumericIndexingOptions,
+		options:           DefaultBooleanIndexingOptions,
 		numPlainTextBytes: uint64(len(value)),
 	}
 }
 
 func NewBooleanField(name string, arrayPositions []uint64, b bool) *BooleanField {
-	return NewBooleanFieldWithIndexingOptions(name, arrayPositions, b, DefaultNumericIndexingOptions)
+	return NewBooleanFieldWithIndexingOptions(name, arrayPositions, b, DefaultBooleanIndexingOptions)
 }
 
 func NewBooleanFieldWithIndexingOptions(name string, arrayPositions []uint64, b bool, options index.FieldIndexingOptions) *BooleanField {

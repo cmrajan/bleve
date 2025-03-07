@@ -25,6 +25,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/microseconds"
+	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/milliseconds"
+	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/nanoseconds"
+	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/seconds"
 	"github.com/blevesearch/bleve/v2/document"
 	"github.com/blevesearch/bleve/v2/index/scorch"
 	"github.com/blevesearch/bleve/v2/index/upsidedown"
@@ -34,6 +38,7 @@ import (
 	"github.com/blevesearch/bleve/v2/search/collector"
 	"github.com/blevesearch/bleve/v2/search/facet"
 	"github.com/blevesearch/bleve/v2/search/highlight"
+	"github.com/blevesearch/bleve/v2/search/query"
 	"github.com/blevesearch/bleve/v2/util"
 	index "github.com/blevesearch/bleve_index_api"
 	"github.com/blevesearch/geo/s2"
@@ -252,6 +257,8 @@ func (i *indexImpl) Index(id string, data interface{}) (err error) {
 		return ErrorIndexClosed
 	}
 
+	i.FireIndexEvent()
+
 	doc := document.NewDocument(id)
 	err = i.m.MapDocument(doc, data)
 	if err != nil {
@@ -259,6 +266,40 @@ func (i *indexImpl) Index(id string, data interface{}) (err error) {
 	}
 	err = i.i.Update(doc)
 	return
+}
+
+// IndexSynonym indexes a synonym definition, with the specified id and belonging to the specified collection.
+// Synonym definition defines term relationships for query expansion in searches.
+func (i *indexImpl) IndexSynonym(id string, collection string, definition *SynonymDefinition) error {
+	if id == "" {
+		return ErrorEmptyID
+	}
+
+	i.mutex.RLock()
+	defer i.mutex.RUnlock()
+
+	if !i.open {
+		return ErrorIndexClosed
+	}
+
+	i.FireIndexEvent()
+
+	synMap, ok := i.m.(mapping.SynonymMapping)
+	if !ok {
+		return ErrorSynonymSearchNotSupported
+	}
+
+	if err := definition.Validate(); err != nil {
+		return err
+	}
+
+	doc := document.NewSynonymDocument(id)
+	err := synMap.MapSynonymDocument(doc, collection, definition.Input, definition.Synonyms)
+	if err != nil {
+		return err
+	}
+	err = i.i.Update(doc)
+	return err
 }
 
 // IndexAdvanced takes a document.Document object
@@ -433,6 +474,64 @@ func memNeededForSearch(req *SearchRequest,
 	return uint64(estimate)
 }
 
+func (i *indexImpl) preSearch(ctx context.Context, req *SearchRequest, reader index.IndexReader) (*SearchResult, error) {
+	var knnHits []*search.DocumentMatch
+	var err error
+	if requestHasKNN(req) {
+		knnHits, err = i.runKnnCollector(ctx, req, reader, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var fts search.FieldTermSynonymMap
+	var count uint64
+	var fieldCardinality map[string]int
+	if !isMatchNoneQuery(req.Query) {
+		if synMap, ok := i.m.(mapping.SynonymMapping); ok {
+			if synReader, ok := reader.(index.ThesaurusReader); ok {
+				fts, err = query.ExtractSynonyms(ctx, synMap, synReader, req.Query, fts)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		if ok := isBM25Enabled(i.m); ok {
+			fieldCardinality = make(map[string]int)
+			count, err = reader.DocCount()
+			if err != nil {
+				return nil, err
+			}
+
+			fs := make(query.FieldSet)
+			fs, err := query.ExtractFields(req.Query, i.m, fs)
+			if err != nil {
+				return nil, err
+			}
+			for field := range fs {
+				dict, err := reader.FieldDict(field)
+				if err != nil {
+					return nil, err
+				}
+				fieldCardinality[field] = dict.Cardinality()
+			}
+		}
+	}
+
+	return &SearchResult{
+		Status: &SearchStatus{
+			Total:      1,
+			Successful: 1,
+		},
+		Hits:          knnHits,
+		SynonymResult: fts,
+		BM25Stats: &search.BM25Stats{
+			DocCount:         float64(count),
+			FieldCardinality: fieldCardinality,
+		},
+	}, nil
+}
+
 // SearchInContext executes a search request operation within the provided
 // Context. Returns a SearchResult object or an error.
 func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr *SearchResult, err error) {
@@ -443,6 +542,25 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 
 	if !i.open {
 		return nil, ErrorIndexClosed
+	}
+
+	// open a reader for this search
+	indexReader, err := i.i.Reader()
+	if err != nil {
+		return nil, fmt.Errorf("error opening index reader %v", err)
+	}
+	defer func() {
+		if cerr := indexReader.Close(); err == nil && cerr != nil {
+			err = cerr
+		}
+	}()
+
+	if _, ok := ctx.Value(search.PreSearchKey).(bool); ok {
+		preSearchResult, err := i.preSearch(ctx, req, indexReader)
+		if err != nil {
+			return nil, err
+		}
+		return preSearchResult, nil
 	}
 
 	var reverseQueryExecution bool
@@ -460,16 +578,84 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 		coll = collector.NewTopNCollector(req.Size, req.From, req.Sort)
 	}
 
-	// open a reader for this search
-	indexReader, err := i.i.Reader()
-	if err != nil {
-		return nil, fmt.Errorf("error opening index reader %v", err)
-	}
-	defer func() {
-		if cerr := indexReader.Close(); err == nil && cerr != nil {
-			err = cerr
+	var knnHits []*search.DocumentMatch
+	var skipKNNCollector bool
+
+	var fts search.FieldTermSynonymMap
+	var skipSynonymCollector bool
+
+	var bm25Data *search.BM25Stats
+	var ok bool
+	if req.PreSearchData != nil {
+		for k, v := range req.PreSearchData {
+			switch k {
+			case search.KnnPreSearchDataKey:
+				if v != nil {
+					knnHits, ok = v.([]*search.DocumentMatch)
+					if !ok {
+						return nil, fmt.Errorf("knn preSearchData must be of type []*search.DocumentMatch")
+					}
+					skipKNNCollector = true
+				}
+			case search.SynonymPreSearchDataKey:
+				if v != nil {
+					fts, ok = v.(search.FieldTermSynonymMap)
+					if !ok {
+						return nil, fmt.Errorf("synonym preSearchData must be of type search.FieldTermSynonymMap")
+					}
+					skipSynonymCollector = true
+				}
+			case search.BM25PreSearchDataKey:
+				if v != nil {
+					bm25Data, ok = v.(*search.BM25Stats)
+					if !ok {
+						return nil, fmt.Errorf("bm25 preSearchData must be of type map[string]interface{}")
+					}
+				}
+			}
 		}
-	}()
+	}
+	if !skipKNNCollector && requestHasKNN(req) {
+		knnHits, err = i.runKnnCollector(ctx, req, indexReader, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if !skipSynonymCollector {
+		if synMap, ok := i.m.(mapping.SynonymMapping); ok && synMap.SynonymCount() > 0 {
+			if synReader, ok := indexReader.(index.ThesaurusReader); ok {
+				fts, err = query.ExtractSynonyms(ctx, synMap, synReader, req.Query, fts)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	setKnnHitsInCollector(knnHits, req, coll)
+
+	if fts != nil {
+		if is, ok := indexReader.(*scorch.IndexSnapshot); ok {
+			is.UpdateSynonymSearchCount(1)
+		}
+		ctx = context.WithValue(ctx, search.FieldTermSynonymMapKey, fts)
+	}
+
+	scoringModelCallback := func() string {
+		if isBM25Enabled(i.m) {
+			return index.BM25Scoring
+		}
+		return index.DefaultScoringModel
+	}
+	ctx = context.WithValue(ctx, search.GetScoringModelCallbackKey,
+		search.GetScoringModelCallbackFn(scoringModelCallback))
+
+	// set the bm25 presearch data (stats important for consistent scoring) in
+	// the context object
+	if bm25Data != nil {
+		ctx = context.WithValue(ctx, search.BM25PreSearchDataKey, bm25Data)
+	}
 
 	// This callback and variable handles the tracking of bytes read
 	//  1. as part of creation of tfr and its Next() calls which is
@@ -496,11 +682,7 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 	ctx = context.WithValue(ctx, search.GeoBufferPoolCallbackKey,
 		search.GeoBufferPoolCallbackFunc(getBufferPool))
 
-	// Using a disjunction query to get union of results from KNN query
-	// and the original query
-	searchQuery := disjunctQueryWithKNN(req)
-
-	searcher, err := searchQuery.Searcher(ctx, indexReader, i.m, search.SearcherOptions{
+	searcher, err := req.Query.Searcher(ctx, indexReader, i.m, search.SearcherOptions{
 		Explain:            req.Explain,
 		IncludeTermVectors: req.IncludeLocations || req.Highlight != nil,
 		Score:              req.Score,
@@ -544,14 +726,14 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 					if dateTimeParser == nil {
 						return nil, fmt.Errorf("no date time parser named `%s` registered", dateTimeParserName)
 					}
-					start, end, startLayout, endLayout, err := dr.ParseDates(dateTimeParser)
+					start, end, err := dr.ParseDates(dateTimeParser)
 					if err != nil {
 						return nil, fmt.Errorf("ParseDates err: %v, using date time parser named %s", err, dateTimeParserName)
 					}
 					if start.IsZero() && end.IsZero() {
 						return nil, fmt.Errorf("date range query must specify either start, end or both for date range name '%s'", dr.Name)
 					}
-					facetBuilder.AddRange(dr.Name, start, end, startLayout, endLayout)
+					facetBuilder.AddRange(dr.Name, start, end)
 				}
 				facetsBuilder.Add(facetName, facetBuilder)
 			} else {
@@ -609,7 +791,9 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 
 	var storedFieldsCost uint64
 	for _, hit := range hits {
-		if i.name != "" {
+		// KNN documents will already have their Index value set as part of the knn collector output
+		// so check if the index is empty and set it to the current index name
+		if i.name != "" && hit.Index == "" {
 			hit.Index = i.name
 		}
 		err, storedFieldsBytes := LoadAndHighlightFields(hit, req, i.name, indexReader, highlighter)
@@ -642,18 +826,23 @@ func (i *indexImpl) SearchInContext(ctx context.Context, req *SearchRequest) (sr
 		req.SearchAfter = nil
 	}
 
-	return &SearchResult{
+	rv := &SearchResult{
 		Status: &SearchStatus{
 			Total:      1,
 			Successful: 1,
 		},
-		Request:  req,
 		Hits:     hits,
 		Total:    coll.Total(),
 		MaxScore: coll.MaxScore(),
 		Took:     searchDuration,
 		Facets:   coll.FacetResults(),
-	}, nil
+	}
+
+	if req.Explain {
+		rv.Request = req
+	}
+
+	return rv, nil
 }
 
 func LoadAndHighlightFields(hit *search.DocumentMatch, req *SearchRequest,
@@ -663,7 +852,7 @@ func LoadAndHighlightFields(hit *search.DocumentMatch, req *SearchRequest,
 	if len(req.Fields) > 0 || highlighter != nil {
 		doc, err := r.Document(hit.ID)
 		if err == nil && doc != nil {
-			if len(req.Fields) > 0 {
+			if len(req.Fields) > 0 && hit.Fields == nil {
 				totalStoredFieldsBytes = doc.StoredFieldsBytes()
 				fieldsToLoad := deDuplicate(req.Fields)
 				for _, f := range fieldsToLoad {
@@ -682,10 +871,28 @@ func LoadAndHighlightFields(hit *search.DocumentMatch, req *SearchRequest,
 								datetime, layout, err := docF.DateTime()
 								if err == nil {
 									if layout == "" {
-										// layout not set probably means it was indexed as a timestamp
-										value = strconv.FormatInt(datetime.UnixNano(), 10)
+										// missing layout means we fallback to
+										// the default layout which is RFC3339
+										value = datetime.Format(time.RFC3339)
 									} else {
-										value = datetime.Format(layout)
+										// the layout here can now either be representative
+										// of an actual datetime layout or a timestamp
+										switch layout {
+										case seconds.Name:
+											value = strconv.FormatInt(datetime.Unix(), 10)
+										case milliseconds.Name:
+											value = strconv.FormatInt(datetime.UnixMilli(), 10)
+										case microseconds.Name:
+											value = strconv.FormatInt(datetime.UnixMicro(), 10)
+										case nanoseconds.Name:
+											value = strconv.FormatInt(datetime.UnixNano(), 10)
+										default:
+											// the layout for formatting the date to a string
+											// is provided by a datetime parser which is not
+											// handling the timestamp case, hence the layout
+											// can be directly used to format the date
+											value = datetime.Format(layout)
+										}
 									}
 								}
 							case index.BooleanField:
@@ -705,6 +912,11 @@ func LoadAndHighlightFields(hit *search.DocumentMatch, req *SearchRequest,
 								v, err := docF.GeoShape()
 								if err == nil {
 									value = v
+								}
+							case index.IPField:
+								ip, err := docF.IP()
+								if err == nil {
+									value = ip.String()
 								}
 							}
 
@@ -952,6 +1164,10 @@ func (f *indexImplFieldDict) Close() error {
 	return f.indexReader.Close()
 }
 
+func (f *indexImplFieldDict) Cardinality() int {
+	return f.fieldDict.Cardinality()
+}
+
 // helper function to remove duplicate entries from slice of strings
 func deDuplicate(fields []string) []string {
 	entries := make(map[string]struct{})
@@ -996,22 +1212,23 @@ func (i *indexImpl) CopyTo(d index.Directory) (err error) {
 		return ErrorIndexClosed
 	}
 
-	indexReader, err := i.i.Reader()
-	if err != nil {
-		return err
+	copyIndex, ok := i.i.(index.CopyIndex)
+	if !ok {
+		return fmt.Errorf("index implementation does not support copy reader")
 	}
+
+	copyReader := copyIndex.CopyReader()
+	if copyReader == nil {
+		return fmt.Errorf("index's copyReader is nil")
+	}
+
 	defer func() {
-		if cerr := indexReader.Close(); err == nil && cerr != nil {
+		if cerr := copyReader.CloseCopyReader(); err == nil && cerr != nil {
 			err = cerr
 		}
 	}()
 
-	irc, ok := indexReader.(IndexCopyable)
-	if !ok {
-		return fmt.Errorf("index implementation does not support copy")
-	}
-
-	err = irc.CopyTo(d)
+	err = copyReader.CopyTo(d)
 	if err != nil {
 		return fmt.Errorf("error copying index metadata: %v", err)
 	}
@@ -1032,4 +1249,17 @@ func (f FileSystemDirectory) GetWriter(filePath string) (io.WriteCloser,
 
 	return os.OpenFile(filepath.Join(string(f), dir, file),
 		os.O_RDWR|os.O_CREATE, 0600)
+}
+
+func (i *indexImpl) FireIndexEvent() {
+	// get the internal index implementation
+	internalIndex, err := i.Advanced()
+	if err != nil {
+		return
+	}
+	// check if the internal index implementation supports events
+	if internalEventIndex, ok := internalIndex.(index.EventIndex); ok {
+		// fire the Index() event
+		internalEventIndex.FireIndexEvent()
+	}
 }

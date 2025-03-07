@@ -1,4 +1,4 @@
-//  Copyright (c) 2014 Couchbase, Inc.
+//  Copyright (c) 2023 Couchbase, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,27 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package http
+//go:build !vectors
+// +build !vectors
+
+package searcher
 
 import (
-	"net/http"
+	"context"
+
+	"github.com/blevesearch/bleve/v2/search"
+	index "github.com/blevesearch/bleve_index_api"
 )
 
-type ListIndexesHandler struct {
-}
-
-func NewListIndexesHandler() *ListIndexesHandler {
-	return &ListIndexesHandler{}
-}
-
-func (h *ListIndexesHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	indexNames := IndexNames()
-	rv := struct {
-		Status  string   `json:"status"`
-		Indexes []string `json:"indexes"`
-	}{
-		Status:  "ok",
-		Indexes: indexNames,
-	}
-	mustEncode(w, rv)
+func optimizeKNN(ctx context.Context, indexReader index.IndexReader,
+	qsearchers []search.Searcher) error {
+	// No-op
+	return nil
 }

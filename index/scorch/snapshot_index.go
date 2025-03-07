@@ -26,7 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/blevesearch/bleve/v2/document"
 	index "github.com/blevesearch/bleve_index_api"
 	segment "github.com/blevesearch/scorch_segment_api/v2"
@@ -42,24 +42,16 @@ type asynchSegmentResult struct {
 	dict    segment.TermDictionary
 	dictItr segment.DictionaryIterator
 
-	index int
-	docs  *roaring.Bitmap
+	cardinality int
+	index       int
+	docs        *roaring.Bitmap
 
-	postings segment.PostingsList
+	thesItr segment.ThesaurusIterator
 
 	err error
 }
 
 var reflectStaticSizeIndexSnapshot int
-
-// DefaultFieldTFRCacheThreshold limits the number of TermFieldReaders(TFR) for
-// a field in an index snapshot. Without this limit, when recycling TFRs, it is
-// possible that a very large number of TFRs may be added to the recycle
-// cache, which could eventually lead to significant memory consumption.
-// This threshold can be overwritten by users at the library level by changing the
-// exported variable, or at the index level by setting the FieldTFRCacheThreshold
-// in the kvConfig.
-var DefaultFieldTFRCacheThreshold uint64 = 10
 
 func init() {
 	var is interface{} = IndexSnapshot{}
@@ -146,6 +138,7 @@ func (is *IndexSnapshot) newIndexSnapshotFieldDict(field string,
 
 	results := make(chan *asynchSegmentResult)
 	var totalBytesRead uint64
+	var fieldCardinality int64
 	for _, s := range is.segment {
 		go func(s *SegmentSnapshot) {
 			dict, err := s.segment.Dictionary(field)
@@ -155,6 +148,7 @@ func (is *IndexSnapshot) newIndexSnapshotFieldDict(field string,
 				if dictStats, ok := dict.(segment.DiskStatsReporter); ok {
 					atomic.AddUint64(&totalBytesRead, dictStats.BytesRead())
 				}
+				atomic.AddInt64(&fieldCardinality, int64(dict.Cardinality()))
 				if randomLookup {
 					results <- &asynchSegmentResult{dict: dict}
 				} else {
@@ -169,6 +163,7 @@ func (is *IndexSnapshot) newIndexSnapshotFieldDict(field string,
 		snapshot: is,
 		cursors:  make([]*segmentDictCursor, 0, len(is.segment)),
 	}
+
 	for count := 0; count < len(is.segment); count++ {
 		asr := <-results
 		if asr.err != nil && err == nil {
@@ -192,6 +187,7 @@ func (is *IndexSnapshot) newIndexSnapshotFieldDict(field string,
 			}
 		}
 	}
+	rv.cardinality = int(fieldCardinality)
 	rv.bytesRead = totalBytesRead
 	// after ensuring we've read all items on channel
 	if err != nil {
@@ -269,17 +265,32 @@ func (is *IndexSnapshot) FieldDictPrefix(field string,
 
 func (is *IndexSnapshot) FieldDictRegexp(field string,
 	termRegex string) (index.FieldDict, error) {
+	fd, _, err := is.FieldDictRegexpAutomaton(field, termRegex)
+	return fd, err
+}
+
+func (is *IndexSnapshot) FieldDictRegexpAutomaton(field string,
+	termRegex string) (index.FieldDict, index.RegexAutomaton, error) {
+	return is.fieldDictRegexp(field, termRegex)
+}
+
+func (is *IndexSnapshot) fieldDictRegexp(field string,
+	termRegex string) (index.FieldDict, index.RegexAutomaton, error) {
 	// TODO: potential optimization where the literal prefix represents the,
 	//       entire regexp, allowing us to use PrefixIterator(prefixTerm)?
 
 	a, prefixBeg, prefixEnd, err := parseRegexp(termRegex)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return is.newIndexSnapshotFieldDict(field, func(is segment.TermDictionary) segment.DictionaryIterator {
+	fd, err := is.newIndexSnapshotFieldDict(field, func(is segment.TermDictionary) segment.DictionaryIterator {
 		return is.AutomatonIterator(a, prefixBeg, prefixEnd)
 	}, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fd, a, nil
 }
 
 func (is *IndexSnapshot) getLevAutomaton(term string,
@@ -294,20 +305,37 @@ func (is *IndexSnapshot) getLevAutomaton(term string,
 
 func (is *IndexSnapshot) FieldDictFuzzy(field string,
 	term string, fuzziness int, prefix string) (index.FieldDict, error) {
+	fd, _, err := is.FieldDictFuzzyAutomaton(field, term, fuzziness, prefix)
+	return fd, err
+}
+
+func (is *IndexSnapshot) FieldDictFuzzyAutomaton(field string,
+	term string, fuzziness int, prefix string) (index.FieldDict, index.FuzzyAutomaton, error) {
+	return is.fieldDictFuzzy(field, term, fuzziness, prefix)
+}
+
+func (is *IndexSnapshot) fieldDictFuzzy(field string,
+	term string, fuzziness int, prefix string) (index.FieldDict, index.FuzzyAutomaton, error) {
 	a, err := is.getLevAutomaton(term, uint8(fuzziness))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
+	var fa index.FuzzyAutomaton
+	if vfa, ok := a.(vellum.FuzzyAutomaton); ok {
+		fa = vfa
+	}
 	var prefixBeg, prefixEnd []byte
 	if prefix != "" {
 		prefixBeg = []byte(prefix)
 		prefixEnd = calculateExclusiveEndFromPrefix(prefixBeg)
 	}
-
-	return is.newIndexSnapshotFieldDict(field, func(is segment.TermDictionary) segment.DictionaryIterator {
+	fd, err := is.newIndexSnapshotFieldDict(field, func(is segment.TermDictionary) segment.DictionaryIterator {
 		return is.AutomatonIterator(a, prefixBeg, prefixEnd)
 	}, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fd, fa, nil
 }
 
 func (is *IndexSnapshot) FieldDictContains(field string) (index.FieldDictContains, error) {
@@ -471,14 +499,42 @@ func (is *IndexSnapshot) Document(id string) (rv index.Document, err error) {
 	return rvd, nil
 }
 
+// In a multi-segment index, each document has:
+// 1. a local docnum - local to the segment
+// 2. a global docnum - unique identifier across the index
+// This function returns the segment index(the segment in which the docnum is present)
+// and local docnum of a document.
 func (is *IndexSnapshot) segmentIndexAndLocalDocNumFromGlobal(docNum uint64) (int, uint64) {
 	segmentIndex := sort.Search(len(is.offsets),
 		func(x int) bool {
 			return is.offsets[x] > docNum
 		}) - 1
 
-	localDocNum := docNum - is.offsets[segmentIndex]
+	localDocNum := is.localDocNumFromGlobal(segmentIndex, docNum)
 	return int(segmentIndex), localDocNum
+}
+
+// This function returns the local docnum, given the segment index and global docnum
+func (is *IndexSnapshot) localDocNumFromGlobal(segmentIndex int, docNum uint64) uint64 {
+	return docNum - is.offsets[segmentIndex]
+}
+
+// Function to return a mapping of the segment index to the live global	doc nums
+// in the segment of the specified index snapshot.
+func (is *IndexSnapshot) globalDocNums() map[int]*roaring.Bitmap {
+	if len(is.segment) == 0 {
+		return nil
+	}
+
+	segmentIndexGlobalDocNums := make(map[int]*roaring.Bitmap)
+
+	for i := range is.segment {
+		segmentIndexGlobalDocNums[i] = roaring.NewBitmap()
+		for _, localDocNum := range is.segment[i].DocNumbersLive().ToArray() {
+			segmentIndexGlobalDocNums[i].Add(localDocNum + uint32(is.offsets[i]))
+		}
+	}
+	return segmentIndexGlobalDocNums
 }
 
 func (is *IndexSnapshot) ExternalID(id index.IndexInternalID) (string, error) {
@@ -612,10 +668,26 @@ func (is *IndexSnapshot) allocTermFieldReaderDicts(field string) (tfr *IndexSnap
 	}
 }
 
-func (is *IndexSnapshot) getFieldTFRCacheThreshold() uint64 {
+// DefaultFieldTFRCacheThreshold limits the number of TermFieldReaders(TFR) for
+// a field in an index snapshot. Without this limit, when recycling TFRs, it is
+// possible that a very large number of TFRs may be added to the recycle
+// cache, which could eventually lead to significant memory consumption.
+// This threshold can be overwritten by users at the library level by changing the
+// exported variable, or at the index level by setting the "fieldTFRCacheThreshold"
+// in the kvConfig.
+var DefaultFieldTFRCacheThreshold int = 0 // disabled because it causes MB-64604
+
+func (is *IndexSnapshot) getFieldTFRCacheThreshold() int {
 	if is.parent.config != nil {
-		if _, ok := is.parent.config["FieldTFRCacheThreshold"]; ok {
-			return is.parent.config["FieldTFRCacheThreshold"].(uint64)
+		if val, exists := is.parent.config["fieldTFRCacheThreshold"]; exists {
+			if x, ok := val.(float64); ok {
+				// JSON unmarshal-ed into a map[string]interface{} will default
+				// to float64 for numbers, so we need to check for float64 first.
+				return int(x)
+			} else if x, ok := val.(int); ok {
+				// If library users provided an int in the config, we'll honor it.
+				return x
+			}
 		}
 	}
 	return DefaultFieldTFRCacheThreshold
@@ -642,7 +714,7 @@ func (is *IndexSnapshot) recycleTermFieldReader(tfr *IndexSnapshotTermFieldReade
 	if is.fieldTFRs == nil {
 		is.fieldTFRs = map[string][]*IndexSnapshotTermFieldReader{}
 	}
-	if uint64(len(is.fieldTFRs[tfr.field])) < is.getFieldTFRCacheThreshold() {
+	if len(is.fieldTFRs[tfr.field]) < is.getFieldTFRCacheThreshold() {
 		tfr.bytesRead = 0
 		is.fieldTFRs[tfr.field] = append(is.fieldTFRs[tfr.field], tfr)
 	}
@@ -904,4 +976,165 @@ func (is *IndexSnapshot) GetSpatialAnalyzerPlugin(typ string) (
 		return nil, fmt.Errorf("no spatial plugin type: %s found", typ)
 	}
 	return rv, nil
+}
+
+func (is *IndexSnapshot) CloseCopyReader() error {
+	// first unmark the segments that were marked for backup by this index snapshot
+	is.parent.rootLock.Lock()
+	for _, seg := range is.segment {
+		var fileName string
+		if perSeg, ok := seg.segment.(segment.PersistedSegment); ok {
+			// segment is persisted
+			fileName = filepath.Base(perSeg.Path())
+		} else {
+			// segment is not persisted
+			// the name of the segment file that is generated if the
+			// the segment is persisted in the future.
+			fileName = zapFileName(seg.id)
+		}
+		if is.parent.copyScheduled[fileName]--; is.parent.copyScheduled[fileName] <= 0 {
+			delete(is.parent.copyScheduled, fileName)
+		}
+	}
+	is.parent.rootLock.Unlock()
+	// close the index snapshot normally
+	return is.Close()
+}
+
+func (is *IndexSnapshot) ThesaurusTermReader(ctx context.Context, thesaurusName string, term []byte) (index.ThesaurusTermReader, error) {
+	rv := &IndexSnapshotThesaurusTermReader{}
+	rv.name = thesaurusName
+	rv.snapshot = is
+	if rv.postings == nil {
+		rv.postings = make([]segment.SynonymsList, len(is.segment))
+	}
+	if rv.iterators == nil {
+		rv.iterators = make([]segment.SynonymsIterator, len(is.segment))
+	}
+	rv.segmentOffset = 0
+
+	if rv.thesauri == nil {
+		rv.thesauri = make([]segment.Thesaurus, len(is.segment))
+		for i, s := range is.segment {
+			if synSeg, ok := s.segment.(segment.ThesaurusSegment); ok {
+				thes, err := synSeg.Thesaurus(thesaurusName)
+				if err != nil {
+					return nil, err
+				}
+				rv.thesauri[i] = thes
+			}
+		}
+	}
+
+	for i, s := range is.segment {
+		if _, ok := s.segment.(segment.ThesaurusSegment); ok {
+			pl, err := rv.thesauri[i].SynonymsList(term, s.deleted, rv.postings[i])
+			if err != nil {
+				return nil, err
+			}
+			rv.postings[i] = pl
+
+			rv.iterators[i] = pl.Iterator(rv.iterators[i])
+		}
+	}
+	return rv, nil
+}
+
+func (is *IndexSnapshot) newIndexSnapshotThesaurusKeys(name string,
+	makeItr func(i segment.Thesaurus) segment.ThesaurusIterator) (*IndexSnapshotThesaurusKeys, error) {
+
+	results := make(chan *asynchSegmentResult, len(is.segment))
+	var wg sync.WaitGroup
+	wg.Add(len(is.segment))
+	for _, s := range is.segment {
+		go func(s *SegmentSnapshot) {
+			defer wg.Done()
+			if synSeg, ok := s.segment.(segment.ThesaurusSegment); ok {
+				thes, err := synSeg.Thesaurus(name)
+				if err != nil {
+					results <- &asynchSegmentResult{err: err}
+				} else {
+					results <- &asynchSegmentResult{thesItr: makeItr(thes)}
+				}
+			}
+		}(s)
+	}
+	// Close the channel after all goroutines complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var err error
+	rv := &IndexSnapshotThesaurusKeys{
+		snapshot: is,
+		cursors:  make([]*segmentThesCursor, 0, len(is.segment)),
+	}
+	for asr := range results {
+		if asr.err != nil && err == nil {
+			err = asr.err
+		} else {
+			next, err2 := asr.thesItr.Next()
+			if err2 != nil && err == nil {
+				err = err2
+			}
+			if next != nil {
+				rv.cursors = append(rv.cursors, &segmentThesCursor{
+					itr:  asr.thesItr,
+					curr: *next,
+				})
+			}
+		}
+	}
+	// after ensuring we've read all items on channel
+	if err != nil {
+		return nil, err
+	}
+
+	return rv, nil
+}
+
+func (is *IndexSnapshot) ThesaurusKeys(name string) (index.ThesaurusKeys, error) {
+	return is.newIndexSnapshotThesaurusKeys(name, func(is segment.Thesaurus) segment.ThesaurusIterator {
+		return is.AutomatonIterator(nil, nil, nil)
+	})
+}
+
+func (is *IndexSnapshot) ThesaurusKeysFuzzy(name string,
+	term string, fuzziness int, prefix string) (index.ThesaurusKeys, error) {
+	a, err := is.getLevAutomaton(term, uint8(fuzziness))
+	if err != nil {
+		return nil, err
+	}
+	var prefixBeg, prefixEnd []byte
+	if prefix != "" {
+		prefixBeg = []byte(prefix)
+		prefixEnd = calculateExclusiveEndFromPrefix(prefixBeg)
+	}
+	return is.newIndexSnapshotThesaurusKeys(name, func(is segment.Thesaurus) segment.ThesaurusIterator {
+		return is.AutomatonIterator(a, prefixBeg, prefixEnd)
+	})
+}
+
+func (is *IndexSnapshot) ThesaurusKeysPrefix(name string,
+	termPrefix []byte) (index.ThesaurusKeys, error) {
+	termPrefixEnd := calculateExclusiveEndFromPrefix(termPrefix)
+	return is.newIndexSnapshotThesaurusKeys(name, func(is segment.Thesaurus) segment.ThesaurusIterator {
+		return is.AutomatonIterator(nil, termPrefix, termPrefixEnd)
+	})
+}
+
+func (is *IndexSnapshot) ThesaurusKeysRegexp(name string,
+	termRegex string) (index.ThesaurusKeys, error) {
+	a, prefixBeg, prefixEnd, err := parseRegexp(termRegex)
+	if err != nil {
+		return nil, err
+	}
+	return is.newIndexSnapshotThesaurusKeys(name, func(is segment.Thesaurus) segment.ThesaurusIterator {
+		return is.AutomatonIterator(a, prefixBeg, prefixEnd)
+	})
+}
+
+func (is *IndexSnapshot) UpdateSynonymSearchCount(delta uint64) {
+	atomic.AddUint64(&is.parent.stats.TotSynonymSearches, delta)
 }

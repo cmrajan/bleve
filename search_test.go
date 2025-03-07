@@ -15,9 +15,13 @@
 package bleve
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/rand"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,6 +30,7 @@ import (
 	"github.com/blevesearch/bleve/v2/analysis"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/keyword"
+	"github.com/blevesearch/bleve/v2/analysis/analyzer/simple"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/standard"
 	html_char_filter "github.com/blevesearch/bleve/v2/analysis/char/html"
 	regexp_char_filter "github.com/blevesearch/bleve/v2/analysis/char/regexp"
@@ -37,6 +42,7 @@ import (
 	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/milliseconds"
 	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/nanoseconds"
 	"github.com/blevesearch/bleve/v2/analysis/datetime/timestamp/seconds"
+	"github.com/blevesearch/bleve/v2/analysis/lang/en"
 	"github.com/blevesearch/bleve/v2/analysis/token/length"
 	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
 	"github.com/blevesearch/bleve/v2/analysis/token/shingle"
@@ -121,6 +127,70 @@ func TestSortedFacetedQuery(t *testing.T) {
 			if v1.Count != expectedResults[v1.Term] {
 				t.Errorf("expected %d, got %d", expectedResults[v1.Term], v1.Count)
 			}
+		}
+	}
+}
+
+func TestMatchAllScorer(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	indexMapping := NewIndexMapping()
+	indexMapping.TypeField = "type"
+	indexMapping.DefaultAnalyzer = "en"
+	documentMapping := NewDocumentMapping()
+
+	contentFieldMapping := NewTextFieldMapping()
+	contentFieldMapping.Index = true
+	contentFieldMapping.Store = true
+	documentMapping.AddFieldMappingsAt("content", contentFieldMapping)
+
+	index, err := New(tmpIndexPath, indexMapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err := index.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	index.Index("1", map[string]interface{}{
+		"country": "india",
+		"content": "k",
+	})
+	index.Index("2", map[string]interface{}{
+		"country": "india",
+		"content": "l",
+	})
+	index.Index("3", map[string]interface{}{
+		"country": "india",
+		"content": "k",
+	})
+
+	d, err := index.DocCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 3 {
+		t.Errorf("expected 3, got %d", d)
+	}
+
+	searchRequest := NewSearchRequest(NewMatchAllQuery())
+	searchRequest.Score = "none"
+	searchResults, err := index.Search(searchRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if searchResults.Total != 3 {
+		t.Fatalf("expected all the 3 docs in the index, got %v", searchResults.Total)
+	}
+
+	for _, hit := range searchResults.Hits {
+		if hit.Score != 0.0 {
+			t.Fatalf("expected 0 score since score = none, got %v", hit.Score)
 		}
 	}
 }
@@ -1196,6 +1266,7 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 	mq1.SetField("description")
 
 	sr := NewSearchRequest(mq1)
+	sr.Explain = true
 	res, err := idx.Search(sr)
 	if err != nil {
 		t.Fatal(err)
@@ -1204,11 +1275,17 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 		t.Errorf("Expected 2 results, but got: %v", res.Total)
 	}
 	for _, hit := range res.Hits {
-		if hit.ID == "doc1" && hit.PartialMatch {
-			t.Errorf("Expected doc1 to be a full match")
-		}
-		if hit.ID == "doc2" && !hit.PartialMatch {
-			t.Errorf("Expected doc2 to be a partial match")
+		switch hit.ID {
+		case "doc1":
+			if hit.Expl.PartialMatch {
+				t.Errorf("Expected doc1 to be a full match")
+			}
+		case "doc2":
+			if !hit.Expl.PartialMatch {
+				t.Errorf("Expected doc2 to be a partial match")
+			}
+		default:
+			t.Errorf("Unexpected document ID: %s", hit.ID)
 		}
 	}
 
@@ -1218,6 +1295,7 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 	mq2.SetFuzziness(2)
 
 	sr = NewSearchRequest(mq2)
+	sr.Explain = true
 	res, err = idx.Search(sr)
 	if err != nil {
 		t.Fatal(err)
@@ -1226,11 +1304,17 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 		t.Errorf("Expected 2 results, but got: %v", res.Total)
 	}
 	for _, hit := range res.Hits {
-		if hit.ID == "doc1" && !hit.PartialMatch {
-			t.Errorf("Expected doc1 to be a partial match")
-		}
-		if hit.ID == "doc2" && hit.PartialMatch {
-			t.Errorf("Expected doc2 to be a full match")
+		switch hit.ID {
+		case "doc1":
+			if !hit.Expl.PartialMatch {
+				t.Errorf("Expected doc1 to be a partial match")
+			}
+		case "doc2":
+			if hit.Expl.PartialMatch {
+				t.Errorf("Expected doc2 to be a full match")
+			}
+		default:
+			t.Errorf("Unexpected document ID: %s", hit.ID)
 		}
 	}
 	// Test 3 - Two Docs hits, both full match
@@ -1238,6 +1322,7 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 	mq3.SetField("description")
 
 	sr = NewSearchRequest(mq3)
+	sr.Explain = true
 	res, err = idx.Search(sr)
 	if err != nil {
 		t.Fatal(err)
@@ -1246,11 +1331,17 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 		t.Errorf("Expected 2 results, but got: %v", res.Total)
 	}
 	for _, hit := range res.Hits {
-		if hit.ID == "doc1" && hit.PartialMatch {
-			t.Errorf("Expected doc1 to be a full match")
-		}
-		if hit.ID == "doc2" && hit.PartialMatch {
-			t.Errorf("Expected doc2 to be a full match")
+		switch hit.ID {
+		case "doc1":
+			if hit.Expl.PartialMatch {
+				t.Errorf("Expected doc1 to be a full match")
+			}
+		case "doc2":
+			if hit.Expl.PartialMatch {
+				t.Errorf("Expected doc2 to be a full match")
+			}
+		default:
+			t.Errorf("Unexpected document ID: %s", hit.ID)
 		}
 	}
 	// Test 4 - Two Docs hits, both partial match
@@ -1258,6 +1349,7 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 	mq4.SetField("description")
 
 	sr = NewSearchRequest(mq4)
+	sr.Explain = true
 	res, err = idx.Search(sr)
 	if err != nil {
 		t.Fatal(err)
@@ -1266,11 +1358,17 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 		t.Errorf("Expected 2 results, but got: %v", res.Total)
 	}
 	for _, hit := range res.Hits {
-		if hit.ID == "doc1" && !hit.PartialMatch {
-			t.Errorf("Expected doc1 to be a partial match")
-		}
-		if hit.ID == "doc2" && !hit.PartialMatch {
-			t.Errorf("Expected doc2 to be a partial match")
+		switch hit.ID {
+		case "doc1":
+			if !hit.Expl.PartialMatch {
+				t.Errorf("Expected doc1 to be a full match")
+			}
+		case "doc2":
+			if !hit.Expl.PartialMatch {
+				t.Errorf("Expected doc2 to be a full match")
+			}
+		default:
+			t.Errorf("Unexpected document ID: %s", hit.ID)
 		}
 	}
 
@@ -1280,6 +1378,7 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 	mq5.SetOperator(1)
 
 	sr = NewSearchRequest(mq5)
+	sr.Explain = true
 	res, err = idx.Search(sr)
 	if err != nil {
 		t.Fatal(err)
@@ -1287,7 +1386,8 @@ func TestMatchQueryPartialMatch(t *testing.T) {
 	if res.Total != 1 {
 		t.Errorf("Expected 1 result, but got: %v", res.Total)
 	}
-	if res.Hits[0].ID == "doc2" || res.Hits[0].PartialMatch {
+	hit := res.Hits[0]
+	if hit.ID != "doc1" || hit.Expl.PartialMatch {
 		t.Errorf("Expected doc1 to be a full match")
 	}
 }
@@ -2773,8 +2873,7 @@ func TestDateRangeStringQuery(t *testing.T) {
 		}
 	}
 }
-
-func TestDateRangeFaceQueriesWithCustomDateTimeParser(t *testing.T) {
+func TestDateRangeFacetQueriesWithCustomDateTimeParser(t *testing.T) {
 	idxMapping := NewIndexMapping()
 
 	err := idxMapping.AddCustomDateTimeParser("customDT", map[string]interface{}{
@@ -2873,8 +2972,8 @@ func TestDateRangeFaceQueriesWithCustomDateTimeParser(t *testing.T) {
 			end:   "2001-08-20 18:10:00",
 			result: testFacetResult{
 				name:  "test",
-				start: "2001-08-20 18:00:00",
-				end:   "2001-08-20 18:10:00",
+				start: "2001-08-20T18:00:00Z",
+				end:   "2001-08-20T18:10:00Z",
 				count: 2,
 				err:   nil,
 			},
@@ -2886,8 +2985,8 @@ func TestDateRangeFaceQueriesWithCustomDateTimeParser(t *testing.T) {
 			parser: "queryDT",
 			result: testFacetResult{
 				name:  "test",
-				start: "20/08/2001 6:00PM",
-				end:   "20/08/2001 6:10PM",
+				start: "2001-08-20T18:00:00Z",
+				end:   "2001-08-20T18:10:00Z",
 				count: 2,
 				err:   nil,
 			},
@@ -2899,8 +2998,8 @@ func TestDateRangeFaceQueriesWithCustomDateTimeParser(t *testing.T) {
 			parser: "customDT",
 			result: testFacetResult{
 				name:  "test",
-				start: "20/08/2001 15:00:00",
-				end:   "2001/08/20 6:10PM",
+				start: "2001-08-20T15:00:00Z",
+				end:   "2001-08-20T18:10:00Z",
 				count: 2,
 				err:   nil,
 			},
@@ -2911,7 +3010,7 @@ func TestDateRangeFaceQueriesWithCustomDateTimeParser(t *testing.T) {
 			parser: "customDT",
 			result: testFacetResult{
 				name:  "test",
-				end:   "2001/08/20 6:15PM",
+				end:   "2001-08-20T18:15:00Z",
 				count: 3,
 				err:   nil,
 			},
@@ -2922,7 +3021,7 @@ func TestDateRangeFaceQueriesWithCustomDateTimeParser(t *testing.T) {
 			parser: "queryDT",
 			result: testFacetResult{
 				name:  "test",
-				start: "20/08/2001 6:15PM",
+				start: "2001-08-20T18:15:00Z",
 				count: 2,
 				err:   nil,
 			},
@@ -3051,7 +3150,7 @@ func TestDateRangeTimestampQueries(t *testing.T) {
 		}
 	}()
 
-	documents := map[string]map[string]interface{}{
+	documents := map[string]map[string]string{
 		"doc1": {
 			"date":         "2001/08/20 03:00:10",
 			"seconds":      "998276410",
@@ -3101,15 +3200,11 @@ func TestDateRangeTimestampQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	type testResult struct {
-		docID    string // doc ID of the hit
-		hitField string // fields returned as part of the hit
-	}
 	type testStruct struct {
 		start        string
 		end          string
 		field        string
-		expectedHits []testResult
+		expectedHits []string
 	}
 
 	testQueries := []testStruct{
@@ -3117,83 +3212,47 @@ func TestDateRangeTimestampQueries(t *testing.T) {
 			start: "2001-08-20T03:00:05",
 			end:   "2001-08-20T03:00:25",
 			field: "date",
-			expectedHits: []testResult{
-				{
-					docID:    "doc1",
-					hitField: "2001/08/20 03:00:10",
-				},
-				{
-					docID:    "doc2",
-					hitField: "2001/08/20 03:00:20",
-				},
+			expectedHits: []string{
+				"doc1",
+				"doc2",
 			},
 		},
 		{
 			start: "2001-08-20T03:00:15",
 			end:   "2001-08-20T03:00:35",
 			field: "seconds",
-			expectedHits: []testResult{
-				{
-					docID:    "doc2",
-					hitField: "998276420000000000",
-				},
-				{
-					docID:    "doc3",
-					hitField: "998276430000000000",
-				},
+			expectedHits: []string{
+				"doc2",
+				"doc3",
 			},
 		},
 		{
 			start: "2001-08-20T03:00:10.150",
 			end:   "2001-08-20T03:00:10.450",
 			field: "milliseconds",
-			expectedHits: []testResult{
-				{
-					docID:    "doc2",
-					hitField: "998276410200000000",
-				},
-				{
-					docID:    "doc3",
-					hitField: "998276410300000000",
-				},
-				{
-					docID:    "doc4",
-					hitField: "998276410400000000",
-				},
+			expectedHits: []string{
+				"doc2",
+				"doc3",
+				"doc4",
 			},
 		},
 		{
 			start: "2001-08-20T03:00:10.100450",
 			end:   "2001-08-20T03:00:10.100650",
 			field: "microseconds",
-			expectedHits: []testResult{
-				{
-					docID:    "doc3",
-					hitField: "998276410100500000",
-				},
-				{
-					docID:    "doc4",
-					hitField: "998276410100600000",
-				},
+			expectedHits: []string{
+				"doc3",
+				"doc4",
 			},
 		},
 		{
 			start: "2001-08-20T03:00:10.100300550",
 			end:   "2001-08-20T03:00:10.100300850",
 			field: "nanoseconds",
-			expectedHits: []testResult{
-				{
-					docID:    "doc3",
-					hitField: "998276410100300600",
-				},
-				{
-					docID:    "doc4",
-					hitField: "998276410100300700",
-				},
-				{
-					docID:    "doc5",
-					hitField: "998276410100300800",
-				},
+			expectedHits: []string{
+				"doc3",
+				"doc4",
+				"doc5",
 			},
 		},
 	}
@@ -3212,7 +3271,7 @@ func TestDateRangeTimestampQueries(t *testing.T) {
 
 		sr := NewSearchRequest(drq)
 		sr.SortBy([]string{dtq.field})
-		sr.Fields = []string{dtq.field}
+		sr.Fields = []string{"*"}
 
 		res, err := idx.Search(sr)
 		if err != nil {
@@ -3222,11 +3281,16 @@ func TestDateRangeTimestampQueries(t *testing.T) {
 			t.Fatalf("expected %d hits, got %d", len(dtq.expectedHits), len(res.Hits))
 		}
 		for i, hit := range res.Hits {
-			if hit.ID != dtq.expectedHits[i].docID {
-				t.Fatalf("expected docID %s, got %s", dtq.expectedHits[i].docID, hit.ID)
+			if hit.ID != dtq.expectedHits[i] {
+				t.Fatalf("expected docID %s, got %s", dtq.expectedHits[i], hit.ID)
 			}
-			if hit.Fields[dtq.field].(string) != dtq.expectedHits[i].hitField {
-				t.Fatalf("expected hit field %s, got %s", dtq.expectedHits[i].hitField, hit.Fields[dtq.field])
+			if len(hit.Fields) != len(documents[hit.ID]) {
+				t.Fatalf("expected hit %s to have %d fields, got %d", hit.ID, len(documents[hit.ID]), len(hit.Fields))
+			}
+			for k, v := range documents[hit.ID] {
+				if hit.Fields[k] != v {
+					t.Fatalf("expected field %s to be %s, got %s", k, v, hit.Fields[k])
+				}
 			}
 		}
 	}
@@ -3373,6 +3437,1086 @@ func TestPercentAndIsoStyleDates(t *testing.T) {
 			if len(res.Hits) != 5 {
 				t.Fatalf("expected %d hits, got %d", 5, len(res.Hits))
 			}
+		}
+	}
+}
+
+func roundToDecimalPlace(num float64, decimalPlaces int) float64 {
+	precision := math.Pow(10, float64(decimalPlaces))
+	return math.Round(num*precision) / precision
+}
+
+func TestScoreBreakdown(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	imap := mapping.NewIndexMapping()
+	textField := mapping.NewTextFieldMapping()
+	textField.Analyzer = simple.Name
+	imap.DefaultMapping.AddFieldMappingsAt("text", textField)
+
+	documents := map[string]map[string]interface{}{
+		"doc1": {
+			"text": "lorem ipsum dolor sit amet consectetur adipiscing elit do eiusmod tempor",
+		},
+		"doc2": {
+			"text": "lorem dolor amet adipiscing sed eiusmod",
+		},
+		"doc3": {
+			"text": "ipsum sit consectetur elit do tempor",
+		},
+		"doc4": {
+			"text": "lorem ipsum sit amet adipiscing elit do eiusmod",
+		},
+	}
+
+	idx, err := New(tmpIndexPath, imap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err = idx.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batch := idx.NewBatch()
+	for docID, doc := range documents {
+		err := batch.Index(docID, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = idx.Batch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type testResult struct {
+		docID          string // doc ID of the hit
+		score          float64
+		scoreBreakdown map[int]float64
+	}
+	type testStruct struct {
+		query      string
+		typ        string
+		expectHits []testResult
+	}
+	testQueries := []testStruct{
+		{
+			// trigger disjunction heap searcher (>10 searchers)
+			// expect score breakdown to have a 0 at BLANK
+			query: `{"disjuncts":[{"term":"lorem","field":"text"},{"term":"blank","field":"text"},{"term":"ipsum","field":"text"},{"term":"blank","field":"text"},{"term":"blank","field":"text"},{"term":"dolor","field":"text"},{"term":"sit","field":"text"},{"term":"amet","field":"text"},{"term":"consectetur","field":"text"},{"term":"blank","field":"text"},{"term":"adipiscing","field":"text"},{"term":"blank","field":"text"},{"term":"elit","field":"text"},{"term":"sed","field":"text"},{"term":"do","field":"text"},{"term":"eiusmod","field":"text"},{"term":"tempor","field":"text"},{"term":"blank","field":"text"},{"term":"blank","field":"text"}]}`,
+			typ:   "disjunction",
+			expectHits: []testResult{
+				{
+					docID:          "doc1",
+					score:          0.3034548543819603,
+					scoreBreakdown: map[int]float64{0: 0.040398807605268316, 2: 0.040398807605268316, 5: 0.0669862776967768, 6: 0.040398807605268316, 7: 0.040398807605268316, 8: 0.0669862776967768, 10: 0.040398807605268316, 12: 0.040398807605268316, 14: 0.040398807605268316, 15: 0.040398807605268316, 16: 0.0669862776967768},
+				},
+				{
+					docID:          "doc2",
+					score:          0.14725661652397853,
+					scoreBreakdown: map[int]float64{0: 0.05470024557900147, 5: 0.09069985124905133, 7: 0.05470024557900147, 10: 0.05470024557900147, 13: 0.15681178542754148, 15: 0.05470024557900147},
+				},
+				{
+					docID:          "doc3",
+					score:          0.12637916362550797,
+					scoreBreakdown: map[int]float64{2: 0.05470024557900147, 6: 0.05470024557900147, 8: 0.09069985124905133, 12: 0.05470024557900147, 14: 0.05470024557900147, 16: 0.09069985124905133},
+				},
+				{
+					docID:          "doc4",
+					score:          0.15956816751152955,
+					scoreBreakdown: map[int]float64{0: 0.04737179972998534, 2: 0.04737179972998534, 6: 0.04737179972998534, 7: 0.04737179972998534, 10: 0.04737179972998534, 12: 0.04737179972998534, 14: 0.04737179972998534, 15: 0.04737179972998534},
+				},
+			},
+		},
+		{
+			// trigger disjunction slice searcher (< 10 searchers)
+			// expect BLANK to give a 0 in score breakdown
+			query: `{"disjuncts":[{"term":"blank","field":"text"},{"term":"lorem","field":"text"},{"term":"ipsum","field":"text"},{"term":"blank","field":"text"},{"term":"blank","field":"text"},{"term":"dolor","field":"text"},{"term":"sit","field":"text"},{"term":"blank","field":"text"}]}`,
+			typ:   "disjunction",
+			expectHits: []testResult{
+				{
+					docID:          "doc1",
+					score:          0.1340684440934241,
+					scoreBreakdown: map[int]float64{1: 0.05756326446708409, 2: 0.05756326446708409, 5: 0.09544709478559595, 6: 0.05756326446708409},
+				},
+				{
+					docID:          "doc2",
+					score:          0.05179425287147191,
+					scoreBreakdown: map[int]float64{1: 0.0779410306721006, 5: 0.129235980813787},
+				},
+				{
+					docID:          "doc3",
+					score:          0.0389705153360503,
+					scoreBreakdown: map[int]float64{2: 0.0779410306721006, 6: 0.0779410306721006},
+				},
+				{
+					docID:          "doc4",
+					score:          0.07593627256602972,
+					scoreBreakdown: map[int]float64{1: 0.06749890894758198, 2: 0.06749890894758198, 6: 0.06749890894758198},
+				},
+			},
+		},
+	}
+	for _, dtq := range testQueries {
+		var q query.Query
+		var rv query.DisjunctionQuery
+		err := json.Unmarshal([]byte(dtq.query), &rv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rv.RetrieveScoreBreakdown(true)
+		q = &rv
+		sr := NewSearchRequest(q)
+		sr.SortBy([]string{"_id"})
+		sr.Explain = true
+		res, err := idx.Search(sr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Hits) != len(dtq.expectHits) {
+			t.Fatalf("expected %d hits, got %d", len(dtq.expectHits), len(res.Hits))
+		}
+		for i, hit := range res.Hits {
+			if hit.ID != dtq.expectHits[i].docID {
+				t.Fatalf("expected docID %s, got %s", dtq.expectHits[i].docID, hit.ID)
+			}
+			if len(hit.ScoreBreakdown) != len(dtq.expectHits[i].scoreBreakdown) {
+				t.Fatalf("expected %d score breakdown, got %d", len(dtq.expectHits[i].scoreBreakdown), len(hit.ScoreBreakdown))
+			}
+			for j, score := range hit.ScoreBreakdown {
+				actualScore := roundToDecimalPlace(score, 3)
+				expectScore := roundToDecimalPlace(dtq.expectHits[i].scoreBreakdown[j], 3)
+				if actualScore != expectScore {
+					t.Fatalf("expected score breakdown %f, got %f", dtq.expectHits[i].scoreBreakdown[j], score)
+				}
+			}
+		}
+	}
+}
+
+func TestAutoFuzzy(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	imap := mapping.NewIndexMapping()
+
+	if err := imap.AddCustomAnalyzer("splitter", map[string]interface{}{
+		"type":          custom.Name,
+		"tokenizer":     whitespace.Name,
+		"token_filters": []interface{}{lowercase.Name},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	textField := mapping.NewTextFieldMapping()
+	textField.Analyzer = "splitter"
+	textField.Store = true
+	textField.IncludeTermVectors = true
+	textField.IncludeInAll = true
+
+	imap.DefaultMapping.Dynamic = false
+	imap.DefaultMapping.AddFieldMappingsAt("model", textField)
+
+	documents := map[string]map[string]interface{}{
+		"product1": {
+			"model": "apple iphone 12",
+		},
+		"product2": {
+			"model": "apple iphone 13",
+		},
+		"product3": {
+			"model": "samsung galaxy s22",
+		},
+		"product4": {
+			"model": "samsung galaxy note",
+		},
+		"product5": {
+			"model": "google pixel 5",
+		},
+		"product6": {
+			"model": "oneplus 9 pro",
+		},
+		"product7": {
+			"model": "xiaomi mi 11",
+		},
+		"product8": {
+			"model": "oppo find x3",
+		},
+		"product9": {
+			"model": "vivo x60 pro",
+		},
+		"product10": {
+			"model": "oneplus 8t pro",
+		},
+		"product11": {
+			"model": "nokia xr20",
+		},
+		"product12": {
+			"model": "poco f1",
+		},
+		"product13": {
+			"model": "asus rog 5",
+		},
+		"product14": {
+			"model": "samsung galaxy a15 5g",
+		},
+		"product15": {
+			"model": "tecno camon 17",
+		},
+	}
+	idx, err := New(tmpIndexPath, imap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err = idx.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	batch := idx.NewBatch()
+	for docID, doc := range documents {
+		err := batch.Index(docID, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = idx.Batch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type testStruct struct {
+		query      string
+		expectHits []string
+	}
+	testQueries := []testStruct{
+		{
+			// match query with fuzziness set to 2
+			query: `{
+					"match" : "applle iphone 12",
+					"fuzziness": 2,
+					"field" : "model"
+				}`,
+			expectHits: []string{"product1", "product2", "product7", "product14", "product15", "product12", "product10", "product3", "product6", "product8"},
+		},
+		{
+			// match query with fuzziness set to "auto"
+			query: `{
+					"match" : "applle iphone 12",
+					"fuzziness": "auto",
+					"field" : "model"
+				}`,
+			expectHits: []string{"product1", "product2"},
+		},
+		{
+			// match query with fuzziness set to 2 with `and` operator
+			query: `{
+					"match" : "applle iphone 12",
+					"fuzziness": 2,
+					"field" : "model",
+					"operator": "and"
+				}`,
+			expectHits: []string{"product1", "product2"},
+		},
+		{
+			// match query with fuzziness set to "auto" with `and`` operator
+			query: `{
+					"match" : "applle iphone 12",
+					"fuzziness": "auto",
+					"field" : "model",
+					"operator": "and"
+				}`,
+			expectHits: []string{"product1"},
+		},
+		// match phrase query with fuzziness set to 2
+		{
+			query: `{
+					"match_phrase" : "onplus 9 pro",
+					"fuzziness": 2,
+					"field" : "model"
+				}`,
+			expectHits: []string{"product6", "product10"},
+		},
+		// match phrase query with fuzziness set to "auto"
+		{
+			query: `{
+				"match_phrase" : "onplus 9 pro",
+				"fuzziness": "auto",
+				"field" : "model"
+			}`,
+			expectHits: []string{"product6"},
+		},
+	}
+
+	for _, dtq := range testQueries {
+		q, err := query.ParseQuery([]byte(dtq.query))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		sr := NewSearchRequest(q)
+		sr.Highlight = NewHighlightWithStyle(ansi.Name)
+		sr.SortBy([]string{"-_score", "_id"})
+		sr.Fields = []string{"*"}
+		sr.Explain = true
+
+		res, err := idx.Search(sr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Hits) != len(dtq.expectHits) {
+			t.Fatalf("expected %d hits, got %d", len(dtq.expectHits), len(res.Hits))
+		}
+		for i, hit := range res.Hits {
+			if hit.ID != dtq.expectHits[i] {
+				t.Fatalf("expected docID %s, got %s", dtq.expectHits[i], hit.ID)
+			}
+		}
+	}
+}
+
+func TestThesaurusTermReader(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	synonymCollection := "collection1"
+
+	synonymSourceName := "english"
+
+	analyzer := simple.Name
+
+	synonymSourceConfig := map[string]interface{}{
+		"collection": synonymCollection,
+		"analyzer":   analyzer,
+	}
+
+	textField := mapping.NewTextFieldMapping()
+	textField.Analyzer = analyzer
+	textField.SynonymSource = synonymSourceName
+
+	imap := mapping.NewIndexMapping()
+	imap.DefaultMapping.AddFieldMappingsAt("text", textField)
+	err := imap.AddSynonymSource(synonymSourceName, synonymSourceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = imap.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := New(tmpIndexPath, imap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err = idx.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	documents := map[string]map[string]interface{}{
+		"doc1": {
+			"text": "quick brown fox eats",
+		},
+		"doc2": {
+			"text": "fast red wolf jumps",
+		},
+		"doc3": {
+			"text": "quick red cat runs",
+		},
+		"doc4": {
+			"text": "speedy brown dog barks",
+		},
+		"doc5": {
+			"text": "fast green rabbit hops",
+		},
+	}
+
+	batch := idx.NewBatch()
+	for docID, doc := range documents {
+		err := batch.Index(docID, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	synonymDocuments := map[string]*SynonymDefinition{
+		"synDoc1": {
+			Synonyms: []string{"quick", "fast", "speedy"},
+		},
+		"synDoc2": {
+			Input:    []string{"color", "colour"},
+			Synonyms: []string{"red", "green", "blue", "yellow", "brown"},
+		},
+		"synDoc3": {
+			Input:    []string{"animal", "creature"},
+			Synonyms: []string{"fox", "wolf", "cat", "dog", "rabbit"},
+		},
+		"synDoc4": {
+			Synonyms: []string{"eats", "jumps", "runs", "barks", "hops"},
+		},
+	}
+
+	for synName, synDef := range synonymDocuments {
+		err := batch.IndexSynonym(synName, synonymCollection, synDef)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = idx.Batch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sco, err := idx.Advanced()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := sco.Reader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err = reader.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	thesReader, ok := reader.(index.ThesaurusReader)
+	if !ok {
+		t.Fatal("expected thesaurus reader")
+	}
+
+	type testStruct struct {
+		queryTerm        string
+		expectedSynonyms []string
+	}
+
+	testQueries := []testStruct{
+		{
+			queryTerm:        "quick",
+			expectedSynonyms: []string{"fast", "speedy"},
+		},
+		{
+			queryTerm:        "red",
+			expectedSynonyms: []string{},
+		},
+		{
+			queryTerm:        "color",
+			expectedSynonyms: []string{"red", "green", "blue", "yellow", "brown"},
+		},
+		{
+			queryTerm:        "colour",
+			expectedSynonyms: []string{"red", "green", "blue", "yellow", "brown"},
+		},
+		{
+			queryTerm:        "animal",
+			expectedSynonyms: []string{"fox", "wolf", "cat", "dog", "rabbit"},
+		},
+		{
+			queryTerm:        "creature",
+			expectedSynonyms: []string{"fox", "wolf", "cat", "dog", "rabbit"},
+		},
+		{
+			queryTerm:        "fox",
+			expectedSynonyms: []string{},
+		},
+		{
+			queryTerm:        "eats",
+			expectedSynonyms: []string{"jumps", "runs", "barks", "hops"},
+		},
+		{
+			queryTerm:        "jumps",
+			expectedSynonyms: []string{"eats", "runs", "barks", "hops"},
+		},
+	}
+
+	for _, test := range testQueries {
+		str, err := thesReader.ThesaurusTermReader(context.Background(), synonymSourceName, []byte(test.queryTerm))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotSynonyms []string
+		for {
+			synonym, err := str.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if synonym == "" {
+				break
+			}
+			gotSynonyms = append(gotSynonyms, string(synonym))
+		}
+		if len(gotSynonyms) != len(test.expectedSynonyms) {
+			t.Fatalf("expected %d synonyms, got %d", len(test.expectedSynonyms), len(gotSynonyms))
+		}
+		sort.Strings(gotSynonyms)
+		sort.Strings(test.expectedSynonyms)
+		for i, syn := range gotSynonyms {
+			if syn != test.expectedSynonyms[i] {
+				t.Fatalf("expected synonym %s, got %s", test.expectedSynonyms[i], syn)
+			}
+		}
+	}
+}
+
+func TestSynonymSearchQueries(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	synonymCollection := "collection1"
+
+	synonymSourceName := "english"
+
+	analyzer := en.AnalyzerName
+
+	synonymSourceConfig := map[string]interface{}{
+		"collection": synonymCollection,
+		"analyzer":   analyzer,
+	}
+
+	textField := mapping.NewTextFieldMapping()
+	textField.Analyzer = analyzer
+	textField.SynonymSource = synonymSourceName
+
+	imap := mapping.NewIndexMapping()
+	imap.DefaultMapping.AddFieldMappingsAt("text", textField)
+	err := imap.AddSynonymSource(synonymSourceName, synonymSourceConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = imap.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idx, err := New(tmpIndexPath, imap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		err = idx.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	documents := map[string]map[string]interface{}{
+		"doc1": {
+			"text": `The hardworking employee consistently strives to exceed expectations.
+					His industrious nature makes him a valuable asset to any team.
+					His conscientious attention to detail ensures that projects are completed efficiently and accurately.
+					He remains persistent even in the face of challenges.`,
+		},
+		"doc2": {
+			"text": `The tranquil surroundings of the retreat provide a perfect escape from the hustle and bustle of city life. 
+					Guests enjoy the peaceful atmosphere, which is perfect for relaxation and rejuvenation. 
+					The calm environment offers the ideal place to meditate and connect with nature. 
+					Even the most stressed individuals find themselves feeling relaxed and at ease.`,
+		},
+		"doc3": {
+			"text": `The house was burned down, leaving only a charred shell behind. 
+					The intense heat of the flames caused the walls to warp and the roof to cave in. 
+					The seared remains of the furniture told the story of the blaze. 
+					The incinerated remains left little more than ashes to remember what once was.`,
+		},
+		"doc4": {
+			"text": `The faithful dog followed its owner everywhere, always loyal and steadfast. 
+					It was devoted to protecting its family, and its reliable nature meant it could always be trusted. 
+					In the face of danger, the dog remained calm, knowing its role was to stay vigilant. 
+					Its trustworthy companionship provided comfort and security.`,
+		},
+		"doc5": {
+			"text": `The lively market is bustling with activity from morning to night. 
+					The dynamic energy of the crowd fills the air as vendors sell their wares. 
+					Shoppers wander from stall to stall, captivated by the vibrant colors and energetic atmosphere. 
+					This place is alive with movement and life.`,
+		},
+		"doc6": {
+			"text": `In moments of crisis, bravery shines through. 
+					It takes valor to step forward when others are afraid to act. 
+					Heroes are defined by their guts and nerve, taking risks to protect others. 
+					Boldness in the face of danger is what sets them apart.`,
+		},
+		"doc7": {
+			"text": `Innovation is the driving force behind progress in every industry. 
+					The company fosters an environment of invention, encouraging creativity at every level. 
+					The focus on novelty and improvement means that ideas are always evolving. 
+					The development of new solutions is at the core of the company's mission.`,
+		},
+		"doc8": {
+			"text": `The blazing sunset cast a radiant glow over the horizon, painting the sky with hues of red and orange. 
+					The intense heat of the day gave way to a fiery display of color. 
+					As the sun set, the glowing light illuminated the landscape, creating a breathtaking scene. 
+					The fiery sky was a sight to behold.`,
+		},
+		"doc9": {
+			"text": `The fertile soil of the valley makes it perfect for farming. 
+					The productive land yields abundant crops year after year. 
+					Farmers rely on the rich, fruitful ground to sustain their livelihoods. 
+					The area is known for its plentiful harvests, supporting both local communities and export markets.`,
+		},
+		"doc10": {
+			"text": `The arid desert is a vast, dry expanse with little water or vegetation. 
+					The barren landscape stretches as far as the eye can see, offering little respite from the scorching sun. 
+					The desolate environment is unforgiving to those who venture too far without preparation. 
+					The parched earth cracks under the heat, creating a harsh, unyielding terrain.`,
+		},
+		"doc11": {
+			"text": `The fox is known for its cunning and intelligence. 
+					As a predator, it relies on its sharp instincts to outwit its prey. 
+					Its vulpine nature makes it both mysterious and fascinating. 
+					The fox's ability to hunt with precision and stealth is what makes it such a formidable hunter.`,
+		},
+		"doc12": {
+			"text": `The dog is often considered man's best friend due to its loyal nature. 
+					As a companion, the hound provides both protection and affection. 
+					The puppy quickly becomes a member of the family, always by your side. 
+					Its playful energy and unshakable loyalty make it a beloved pet.`,
+		},
+		"doc13": {
+			"text": `He worked tirelessly through the night, always persistent in his efforts. 
+					His industrious approach to problem-solving kept the project moving forward. 
+					No matter how difficult the task, he remained focused, always giving his best. 
+					His dedication paid off when the project was completed ahead of schedule.`,
+		},
+		"doc14": {
+			"text": `The river flowed calmly through the valley, its peaceful current offering a sense of tranquility. 
+					Fishermen relaxed by the banks, enjoying the calm waters that reflected the sky above. 
+					The tranquil nature of the river made it a perfect spot for meditation. 
+					As the day ended, the river's quiet flow brought a sense of peace.`,
+		},
+		"doc15": {
+			"text": `After the fire, all that was left was the charred remains of what once was. 
+					The seared walls of the house told a tragic story. 
+					The intensity of the blaze had burned everything in its path, leaving only the smoldering wreckage behind. 
+					The incinerated objects could not be salvaged, and the damage was beyond repair.`,
+		},
+		"doc16": {
+			"text": `The devoted employee always went above and beyond to complete his tasks. 
+					His steadfast commitment to the company made him a valuable team member. 
+					He was reliable, never failing to meet deadlines. 
+					His trustworthiness earned him the respect of his colleagues, and was considered an
+					ingenious expert in his field.`,
+		},
+		"doc17": {
+			"text": `The city is vibrant, full of life and energy. 
+					The dynamic pace of the streets reflects the diverse culture of its inhabitants. 
+					People from all walks of life contribute to the energetic atmosphere. 
+					The city's lively spirit can be felt in every corner, from the bustling markets to the lively festivals.`,
+		},
+		"doc18": {
+			"text": `In a moment of uncertainty, he made a bold decision that would change his life forever. 
+					It took courage and nerve to take the leap, but his bravery paid off. 
+					The guts to face the unknown allowed him to achieve something remarkable. 
+					Being an bright scholar, the skill he demonstrated inspired those around him.`,
+		},
+		"doc19": {
+			"text": `Innovation is often born from necessity, and the lightbulb is a prime example. 
+					Thomas Edison's invention changed the world, offering a new way to see the night. 
+					The creativity involved in developing such a groundbreaking product sparked a wave of 
+					novelty in the scientific community. This improvement in technology continues to shape the modern world.
+					He was a clever academic and a smart researcher.`,
+		},
+		"doc20": {
+			"text": `The fiery volcano erupted with a force that shook the earth. Its radiant lava flowed down the sides, 
+					illuminating the night sky. The intense heat from the eruption could be felt miles away, as the 
+					glowing lava burned everything in its path. The fiery display was both terrifying and mesmerizing.`,
+		},
+	}
+
+	synonymDocuments := map[string]*SynonymDefinition{
+		"synDoc1": {
+			Synonyms: []string{"hardworking", "industrious", "conscientious", "persistent", "focused", "devoted"},
+		},
+		"synDoc2": {
+			Synonyms: []string{"tranquil", "peaceful", "calm", "relaxed", "unruffled"},
+		},
+		"synDoc3": {
+			Synonyms: []string{"burned", "charred", "seared", "incinerated", "singed"},
+		},
+		"synDoc4": {
+			Synonyms: []string{"faithful", "steadfast", "devoted", "reliable", "trustworthy"},
+		},
+		"synDoc5": {
+			Synonyms: []string{"lively", "dynamic", "energetic", "vivid", "vibrating"},
+		},
+		"synDoc6": {
+			Synonyms: []string{"bravery", "valor", "guts", "nerve", "boldness"},
+		},
+		"synDoc7": {
+			Input:    []string{"innovation"},
+			Synonyms: []string{"invention", "creativity", "novelty", "improvement", "development"},
+		},
+		"synDoc8": {
+			Input:    []string{"blazing"},
+			Synonyms: []string{"intense", "radiant", "burning", "fiery", "glowing"},
+		},
+		"synDoc9": {
+			Input:    []string{"fertile"},
+			Synonyms: []string{"productive", "fruitful", "rich", "abundant", "plentiful"},
+		},
+		"synDoc10": {
+			Input:    []string{"arid"},
+			Synonyms: []string{"dry", "barren", "desolate", "parched", "unfertile"},
+		},
+		"synDoc11": {
+			Input:    []string{"fox"},
+			Synonyms: []string{"vulpine", "canine", "predator", "hunter", "pursuer"},
+		},
+		"synDoc12": {
+			Input:    []string{"dog"},
+			Synonyms: []string{"canine", "hound", "puppy", "pup", "companion"},
+		},
+		"synDoc13": {
+			Synonyms: []string{"researcher", "scientist", "scholar", "academic", "expert"},
+		},
+		"synDoc14": {
+			Synonyms: []string{"bright", "clever", "ingenious", "sharp", "astute", "smart"},
+		},
+	}
+
+	// Combine both maps into a slice of map entries (as they both have similar structure)
+	var combinedDocIDs []string
+	for id := range synonymDocuments {
+		combinedDocIDs = append(combinedDocIDs, id)
+	}
+	for id := range documents {
+		combinedDocIDs = append(combinedDocIDs, id)
+	}
+	rand.Shuffle(len(combinedDocIDs), func(i, j int) {
+		combinedDocIDs[i], combinedDocIDs[j] = combinedDocIDs[j], combinedDocIDs[i]
+	})
+
+	// Function to create batches of 5
+	createDocBatches := func(docs []string, batchSize int) [][]string {
+		var batches [][]string
+		for i := 0; i < len(docs); i += batchSize {
+			end := i + batchSize
+			if end > len(docs) {
+				end = len(docs)
+			}
+			batches = append(batches, docs[i:end])
+		}
+		return batches
+	}
+	// Create batches of 5 documents
+	var batchSize = 5
+	docBatches := createDocBatches(combinedDocIDs, batchSize)
+	if len(docBatches) == 0 {
+		t.Fatal("expected batches")
+	}
+	totalDocs := 0
+	for _, batch := range docBatches {
+		totalDocs += len(batch)
+	}
+	if totalDocs != len(combinedDocIDs) {
+		t.Fatalf("expected %d documents, got %d", len(combinedDocIDs), totalDocs)
+	}
+
+	var batches []*Batch
+	for _, docBatch := range docBatches {
+		batch := idx.NewBatch()
+		for _, docID := range docBatch {
+			if synDef, ok := synonymDocuments[docID]; ok {
+				err := batch.IndexSynonym(docID, synonymCollection, synDef)
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				err := batch.Index(docID, documents[docID])
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		batches = append(batches, batch)
+	}
+	for _, batch := range batches {
+		err = idx.Batch(batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type testStruct struct {
+		query      string
+		expectHits []string
+	}
+
+	testQueries := []testStruct{
+		{
+			query: `{
+				"match": "hardworking employee",
+				"field": "text"
+			}`,
+			expectHits: []string{"doc1", "doc13", "doc16", "doc4", "doc7"},
+		},
+		{
+			query: `{
+				"match": "Hardwork and industrius efforts bring lovely and tranqual moments, with a glazing blow of valour.",
+				"field": "text",
+				"fuzziness": "auto"
+			}`,
+			expectHits: []string{
+				"doc1", "doc13", "doc14", "doc15", "doc16",
+				"doc17", "doc18", "doc2", "doc20", "doc3",
+				"doc4", "doc5", "doc6", "doc7", "doc8", "doc9",
+			},
+		},
+		{
+			query: `{
+				"prefix": "in",
+				"field": "text"
+			}`,
+			expectHits: []string{
+				"doc1", "doc11", "doc13", "doc15", "doc16",
+				"doc17", "doc18", "doc19", "doc2", "doc20",
+				"doc3", "doc4", "doc7", "doc8",
+			},
+		},
+		{
+			query: `{
+				"prefix": "vivid",
+				"field": "text"
+			}`,
+			expectHits: []string{
+				"doc17", "doc5",
+			},
+		},
+		{
+			query: `{
+				"match_phrase": "smart academic",
+				"field": "text"
+			}`,
+			expectHits: []string{"doc16", "doc18", "doc19"},
+		},
+		{
+			query: `{
+				"match_phrase": "smrat acedemic",
+				"field": "text",
+				"fuzziness": "auto"
+			}`,
+			expectHits: []string{"doc16", "doc18", "doc19"},
+		},
+		{
+			query: `{
+				"wildcard": "br*",
+				"field": "text"
+			}`,
+			expectHits: []string{"doc11", "doc14", "doc16", "doc18", "doc19", "doc6", "doc8"},
+		},
+	}
+
+	getTotalSynonymSearchStat := func(idx Index) int {
+		ir, err := idx.Advanced()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stat := ir.StatsMap()["synonym_searches"].(uint64)
+		return int(stat)
+	}
+
+	runTestQueries := func(idx Index) error {
+		for _, dtq := range testQueries {
+			q, err := query.ParseQuery([]byte(dtq.query))
+			if err != nil {
+				return err
+			}
+			sr := NewSearchRequest(q)
+			sr.Highlight = NewHighlightWithStyle(ansi.Name)
+			sr.SortBy([]string{"_id"})
+			sr.Fields = []string{"*"}
+			sr.Size = 30
+			sr.Explain = true
+			res, err := idx.Search(sr)
+			if err != nil {
+				return err
+			}
+			if len(res.Hits) != len(dtq.expectHits) {
+				return fmt.Errorf("expected %d hits, got %d", len(dtq.expectHits), len(res.Hits))
+			}
+			// sort the expected hits to match the order of the search results
+			sort.Strings(dtq.expectHits)
+			for i, hit := range res.Hits {
+				if hit.ID != dtq.expectHits[i] {
+					return fmt.Errorf("expected docID %s, got %s", dtq.expectHits[i], hit.ID)
+				}
+			}
+		}
+		return nil
+	}
+	err = runTestQueries(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// now verify that the stat for number of synonym enabled queries is correct
+	totalSynonymSearchStat := getTotalSynonymSearchStat(idx)
+	if totalSynonymSearchStat != len(testQueries) {
+		t.Fatalf("expected %d synonym searches, got %d", len(testQueries), totalSynonymSearchStat)
+	}
+
+	// test with index alias - with 1 batch per index
+	numIndexes := len(batches)
+	indexes := make([]Index, numIndexes)
+	indexesPath := make([]string, numIndexes)
+	for i := 0; i < numIndexes; i++ {
+		tmpIndexPath := createTmpIndexPath(t)
+		idx, err := New(tmpIndexPath, imap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = idx.Batch(batches[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		indexes[i] = idx
+		indexesPath[i] = tmpIndexPath
+	}
+	defer func() {
+		for i := 0; i < numIndexes; i++ {
+			err = indexes[i].Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanupTmpIndexPath(t, indexesPath[i])
+		}
+	}()
+	alias := NewIndexAlias(indexes...)
+	alias.SetIndexMapping(imap)
+	err = runTestQueries(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// verify the synonym search stat for the alias
+	totalSynonymSearchStat = getTotalSynonymSearchStat(indexes[0])
+	if totalSynonymSearchStat != len(testQueries) {
+		t.Fatalf("expected %d synonym searches, got %d", len(testQueries), totalSynonymSearchStat)
+	}
+	for i := 1; i < numIndexes; i++ {
+		idxStat := getTotalSynonymSearchStat(indexes[i])
+		if idxStat != totalSynonymSearchStat {
+			t.Fatalf("expected %d synonym searches, got %d", totalSynonymSearchStat, idxStat)
+		}
+	}
+	if totalSynonymSearchStat != len(testQueries) {
+		t.Fatalf("expected %d synonym searches, got %d", len(testQueries), totalSynonymSearchStat)
+	}
+	// test with multi-level alias now with two index per alias
+	// and having any extra index being in the final alias
+	numAliases := numIndexes / 2
+	extraIndex := numIndexes % 2
+	aliases := make([]IndexAlias, numAliases)
+	for i := 0; i < numAliases; i++ {
+		alias := NewIndexAlias(indexes[i*2], indexes[i*2+1])
+		aliases[i] = alias
+	}
+	if extraIndex > 0 {
+		aliases[numAliases-1].Add(indexes[numIndexes-1])
+	}
+	alias = NewIndexAlias()
+	alias.SetIndexMapping(imap)
+	for i := 0; i < numAliases; i++ {
+		alias.Add(aliases[i])
+	}
+	err = runTestQueries(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// verify the synonym searches stat for the alias
+	totalSynonymSearchStat = getTotalSynonymSearchStat(indexes[0])
+	if totalSynonymSearchStat != 2*len(testQueries) {
+		t.Fatalf("expected %d synonym searches, got %d", len(testQueries), totalSynonymSearchStat)
+	}
+	for i := 1; i < numIndexes; i++ {
+		idxStat := getTotalSynonymSearchStat(indexes[i])
+		if idxStat != totalSynonymSearchStat {
+			t.Fatalf("expected %d synonym searches, got %d", totalSynonymSearchStat, idxStat)
+		}
+	}
+}
+
+func TestGeoDistanceInSort(t *testing.T) {
+	tmpIndexPath := createTmpIndexPath(t)
+	defer cleanupTmpIndexPath(t, tmpIndexPath)
+
+	fm := mapping.NewGeoPointFieldMapping()
+	imap := mapping.NewIndexMapping()
+	imap.DefaultMapping.AddFieldMappingsAt("geo", fm)
+
+	idx, err := New(tmpIndexPath, imap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err = idx.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	qp := []float64{0, 0}
+
+	docs := []struct {
+		id       string
+		point    []float64
+		distance float64
+	}{
+		{
+			id:       "1",
+			point:    []float64{1, 1},
+			distance: geo.Haversin(1, 1, qp[0], qp[1]) * 1000,
+		},
+		{
+			id:       "2",
+			point:    []float64{2, 2},
+			distance: geo.Haversin(2, 2, qp[0], qp[1]) * 1000,
+		},
+		{
+			id:       "3",
+			point:    []float64{3, 3},
+			distance: geo.Haversin(3, 3, qp[0], qp[1]) * 1000,
+		},
+	}
+
+	for _, doc := range docs {
+		idx.Index(doc.id, map[string]interface{}{"geo": doc.point})
+	}
+
+	q := NewGeoDistanceQuery(qp[0], qp[1], "1000000m")
+	q.SetField("geo")
+	req := NewSearchRequest(q)
+	req.Sort = make(search.SortOrder, 0)
+	req.Sort = append(req.Sort, &search.SortGeoDistance{
+		Field: "geo",
+		Desc:  false,
+		Unit:  "m",
+		Lon:   qp[0],
+		Lat:   qp[1],
+	})
+	res, err := idx.Search(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, doc := range res.Hits {
+		hitDist, err := strconv.ParseFloat(doc.Sort[0], 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.Abs(hitDist-docs[i].distance) > 1 {
+			t.Fatalf("distance error greater than 1 meter, expected distance - %v, got - %v", docs[i].distance, hitDist)
 		}
 	}
 }

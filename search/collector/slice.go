@@ -14,7 +14,9 @@
 
 package collector
 
-import "github.com/blevesearch/bleve/v2/search"
+import (
+	"github.com/blevesearch/bleve/v2/search"
+)
 
 type collectStoreSlice struct {
 	slice   search.DocumentMatchCollection
@@ -70,6 +72,10 @@ func (c *collectStoreSlice) Final(skip int, fixup collectorFixup) (search.Docume
 		return c.slice[skip:], nil
 	}
 	return search.DocumentMatchCollection{}, nil
+}
+
+func (c *collectStoreSlice) Internal() search.DocumentMatchCollection {
+	return c.slice
 }
 
 func (c *collectStoreSlice) len() int {
